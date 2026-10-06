@@ -1,0 +1,13 @@
+# Raw dataset and generated outputs (too large for git)
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Editor
+.vscode/
+.idea/
