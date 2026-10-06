@@ -10,7 +10,7 @@ from sentence_transformers import SentenceTransformer
 
 RAW = "data/raw/full_dataset.csv"
 OUT = "data/interim"
-SLICE_SIZE = 100_000          # number of rows read from the CSV
+SLICE_SIZE = 10_000          # number of rows read from the CSV
 MIN_INGS = 2
 MIN_ING_COUNT = 5            # ingredient must appear in at least this many recipes
 DROP_INGREDIENTS = set()     # hub ingredients to remove, e.g. {"salt", "water"}, empty for now

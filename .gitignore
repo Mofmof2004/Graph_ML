@@ -1,13 +1,10 @@
-# Raw dataset and generated outputs (too large for git)
-data/
+# Created by venv; see https://docs.python.org/3/library/venv.html
 
-# Python
-__pycache__/
-*.pyc
-.venv/
-venv/
-.ipynb_checkpoints/
+__pycache__
+.venv
+data
+include
+lib
+lib64
 
-# Editor
-.vscode/
-.idea/
+pyenv.cfg
