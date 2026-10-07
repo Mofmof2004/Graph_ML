@@ -1,12 +1,14 @@
 import json
 import random
 import re
-import unicodedata
 from collections import Counter, defaultdict
 import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
 from sentence_transformers import SentenceTransformer
+
+from normalisation import normalise, norm_title
+from quantities import Properties, recipe_grams
 
 RAW = "data/raw/RecipeNLG_dataset.csv"
 OUT = "data/interim"
@@ -26,64 +28,13 @@ PRINT_DATA_NORMALISATION = True
 
 FEATURE_MODEL = "all-mpnet-base-v2"   # small, fast text model, 384 numbers per text
 COMPUTE_TITLE_FEATURES = True        # also embed recipe titles, as an optional extra
+PROPERTIES = "ingredient_properties.csv"   # density (g/ml), piece and package weight per ingredient
+SHARE_EXPONENT = 0.5   # edge weight = idf * share ** SHARE_EXPONENT; 1 = linear share, 0 = idf only
 
 
 OUT = "data/processed"
-#----------Data Normalisation----------#
-# Normalisation rules
-
-SYNONYMS = {"chili": "chilli", "chile": "chilli", "oleo": "margarine"}
-IRREGULAR = {"leaves": "leaf", "halves": "half", "loaves": "loaf"}
-KEEP_AS_IS = {"molasses", "hummus", "couscous", "asparagus", "swiss", "grits", "lemongrass"}
-
-LEADING_DROP = {
-    "fresh", "frozen", "grated", "shredded", "chopped", "diced", "sliced", "minced",
-    "drained", "toasted", "mashed", "cooked", "softened", "melted", "beaten",
-    "boneless", "skinless", "skinned", "large", "small", "medium", "handful",
-    "very", "warm", "cold", "tap",
-}
-TRAILING_DROP = {"slices", "slice", "pieces", "piece", "bits", "mixed", "chunks", "cubes"}
-
-
-def singularise(word):
-    if word in IRREGULAR:
-        return IRREGULAR[word]
-    if word in KEEP_AS_IS or len(word) <= 3:
-        return word
-    if word.endswith("ies"):
-        return word[:-3] + "y"
-    if word.endswith(("ches", "shes", "xes", "oes")):
-        return word[:-2]
-    if word.endswith("s") and not word.endswith(("ss", "us", "is")):
-        return word[:-1]
-    return word
-
-
-def normalise(name):
-    name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
-    name = name.lower()
-    name = re.sub(r"[^a-z\s-]", " ", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    words = name.split()
-    while len(words) > 1 and words[0] in LEADING_DROP:
-        words = words[1:]
-    while len(words) > 1 and words[-1] in TRAILING_DROP:
-        words = words[:-1]
-    if not words:
-        return None
-    words[-1] = singularise(words[-1])
-    name = " ".join(words)
-    return SYNONYMS.get(name, name)
-
-
-def norm_title(title):
-    title = unicodedata.normalize("NFKD", str(title)).encode("ascii", "ignore").decode()
-    title = title.lower()
-    title = re.sub(r"[^a-z\s]", " ", title)
-    return re.sub(r"\s+", " ", title).strip()
-
 # Load the dataset
-slice_df = pd.read_csv(RAW, nrows=SLICE_SIZE, usecols=["title", "link", "source", "NER"])
+slice_df = pd.read_csv(RAW, nrows=SLICE_SIZE, usecols=["title", "ingredients", "link", "source", "NER"])
 ner = slice_df["NER"].apply(json.loads)
 raw_counts = Counter(name for names in ner for name in names)
 total_mentions = sum(raw_counts.values())
@@ -239,6 +190,36 @@ print("first 5 edges:")
 for r, i in edge_index[:, :5].T:
     print(f"  recipe {r} ({recipes.loc[r, 'title']!r}) -> ingredient {i} ({ingredient_names[i]!r})")
 
+#----------Ingredient Quantities----------#
+
+# Grams of every edge, parsed from the raw ingredient lines.
+# Example: "1/2 c. brown sugar" -> 106 g (via density), "3 eggs" -> 150 g (via piece weight)
+props = Properties(PROPERTIES)
+raw_lines = slice_df["ingredients"].apply(json.loads)
+parsed = [recipe_grams(raw_lines[row], ner[row], normalise, props) for row in recipes["row_id"]]
+edge_grams = np.array([parsed[r].get(i, None) for r, l in enumerate(ing_lists) for i in l], dtype=object)
+
+# Edges without a parseable quantity ("butter", "juice of 1/2 lemon") get the ingredient's
+# median over the recipes where it was parsed, or the overall median if it never was
+is_parsed = np.array([g is not None for g in edge_grams])
+grams_df = pd.DataFrame({"ing": edge_index[1][is_parsed], "g": edge_grams[is_parsed].astype(float)})
+median_grams = grams_df.groupby("ing")["g"].median().reindex(range(len(ingredient_names)))
+median_grams = median_grams.fillna(grams_df["g"].median()).to_numpy()
+edge_grams = np.where(is_parsed, edge_grams, median_grams[edge_index[1]]).astype(np.float64)
+
+# Quantity share: fraction of the recipe's total grams. 500 g chicken in a 1 kg recipe gets 0.5,
+# 200 g chicken in a 2 kg recipe gets 0.1. Shares are independent of how many servings a recipe makes.
+recipe_total = np.bincount(edge_index[0], weights=edge_grams, minlength=len(recipes))
+edge_share = edge_grams / recipe_total[edge_index[0]]
+recipes["total_grams"] = recipe_total.round(1)
+
+print(f"\nquantity parsed for {is_parsed.mean():.1%} of edges, the rest use the ingredient median")
+print(f"recipe weight in grams: median {np.median(recipe_total):.0f}, max {recipe_total.max():.0f}")
+example = recipes.index[recipes["n_ings"].between(4, 6)][0]
+print(f"example: {recipes.loc[example, 'title']!r}")
+for k in np.flatnonzero(edge_index[0] == example):
+    print(f"  {ingredient_names[edge_index[1, k]]:20s} {edge_grams[k]:7.1f} g  share {edge_share[k]:.2f}")
+
 #----------Edge Splits----------#
 
 rng = np.random.default_rng(SEED)
@@ -291,6 +272,33 @@ for name, e in splits.items():
 print(f"ingredients appearing only in heldout recipes: {n_only_heldout}")
 
 
+#----------Edge Weights----------#
+
+# Weight = IDF of the ingredient * its quantity share in the recipe, so rare ingredients
+# that make up much of a recipe count most, and a pinch of salt counts very little.
+# The share is compressed (square root by default): with the linear share, heavy but generic
+# bulk such as 2 qt. water or 3 c. flour dominates the recipe, which made similarity worse.
+# IDF uses the training edges only, so val/test edges do not leak into it.
+n_train_recipes = len(np.unique(splits["train"][0]))
+train_df = np.bincount(splits["train"][1], minlength=len(ingredient_names))
+idf = np.log((1 + n_train_recipes) / (1 + train_df)) + 1.0
+edge_weight = (idf[edge_index[1]] * edge_share ** SHARE_EXPONENT).astype(np.float32)
+weight_splits = {"train": edge_weight[train_idx], "val": edge_weight[val_idx],
+                 "test": edge_weight[test_idx], "heldout": edge_weight[heldout_idx]}
+
+ingredients["property_key"] = [props.match(n) for n in ingredient_names]
+density, piece, package = zip(*(props.get(n) for n in ingredient_names))
+ingredients["density_g_per_ml"], ingredients["piece_g"], ingredients["package_g"] = density, piece, package
+ingredients["median_grams"] = median_grams.round(1)
+ingredients["idf"] = idf.round(4)
+
+print(f"\nedge weight: median {np.median(edge_weight):.3f}, max {edge_weight.max():.3f}")
+for name in ["salt", "sugar", "flour", "chicken"]:
+    if name in ing2id:
+        w = edge_weight[edge_index[1] == ing2id[name]]
+        print(f"  {name:10s} idf {idf[ing2id[name]]:.2f}, median weight {np.median(w):.3f}")
+
+
 #----------Feature Construction----------#
 model = SentenceTransformer(FEATURE_MODEL)   # downloads the model on first run
 
@@ -299,18 +307,24 @@ ingredient_x = model.encode(ingredient_names, batch_size=256,
                             normalize_embeddings=True, show_progress_bar=True).astype(np.float32)
 
 
-# Recipe features: mean of the ingredient features, using only the given edges
-def mean_ingredient_features(edges):
-    # Adjacency matrix: row = recipe, column = ingredient, 1 where an edge exists
-    adj = csr_matrix((np.ones(edges.shape[1], dtype=np.float32), (edges[0], edges[1])),
-                     shape=(n_recipes, len(ingredient_names)))
-    sums = adj @ ingredient_x                              # sum of each recipe's ingredient vectors
-    counts = np.asarray(adj.sum(axis=1))                   # number of ingredients per recipe
-    return (sums / np.maximum(counts, 1)).astype(np.float32)
+# Recipe features: mean of the ingredient features, using only the given edges.
+# With weights, a weighted mean, so the main ingredients dominate the recipe feature.
+def mean_ingredient_features(edges, weights=None):
+    if weights is None:
+        weights = np.ones(edges.shape[1], dtype=np.float32)
+    # Adjacency matrix: row = recipe, column = ingredient, edge weight where an edge exists
+    adj = csr_matrix((weights, (edges[0], edges[1])), shape=(n_recipes, len(ingredient_names)))
+    sums = adj @ ingredient_x                              # weighted sum of each recipe's ingredient vectors
+    totals = np.asarray(adj.sum(axis=1))                   # total weight per recipe
+    return (sums / np.maximum(totals, 1e-12)).astype(np.float32)
 
 
+train_edges = np.concatenate([splits["train"], splits["heldout"]], axis=1)
+train_weights = np.concatenate([weight_splits["train"], weight_splits["heldout"]])
 recipe_x_full = mean_ingredient_features(edge_index)
-recipe_x_train = mean_ingredient_features(np.concatenate([splits["train"], splits["heldout"]], axis=1))
+recipe_x_train = mean_ingredient_features(train_edges)
+recipe_x_full_weighted = mean_ingredient_features(edge_index, edge_weight)
+recipe_x_train_weighted = mean_ingredient_features(train_edges, train_weights)
 
 if COMPUTE_TITLE_FEATURES:
     title_x = model.encode(recipes["title"].astype(str).tolist(), batch_size=256,
@@ -332,7 +346,7 @@ import os
 os.makedirs(OUT, exist_ok=True)
 
 # Tables for humans: recipes, ingredients, and how raw names were cleaned
-recipes[["recipe_id", "row_id", "title", "link", "source", "ings", "n_ings", "heldout"]] \
+recipes[["recipe_id", "row_id", "title", "link", "source", "ings", "n_ings", "total_grams", "heldout"]] \
     .to_csv(f"{OUT}/recipes.csv", index=False)
 ingredients.to_csv(f"{OUT}/ingredients.csv", index=False)
 
@@ -345,10 +359,17 @@ ingredient_map.to_csv(f"{OUT}/ingredient_map.csv", index=False)
 # Edges: all splits in one compressed file, each array of shape [2, E]
 np.savez_compressed(f"{OUT}/edges.npz", all=edge_index, **splits)
 
+# Edge weights, aligned with the edges of the same name in edges.npz, plus the parts they are made of
+np.savez_compressed(f"{OUT}/edge_weights.npz", all=edge_weight, **weight_splits,
+                    grams=edge_grams.astype(np.float32), share=edge_share.astype(np.float32),
+                    parsed=is_parsed)
+
 # Features: one row per node id
 np.save(f"{OUT}/ingredient_x.npy", ingredient_x)
 np.save(f"{OUT}/recipe_x_full.npy", recipe_x_full)
 np.save(f"{OUT}/recipe_x_train.npy", recipe_x_train)
+np.save(f"{OUT}/recipe_x_full_weighted.npy", recipe_x_full_weighted)
+np.save(f"{OUT}/recipe_x_train_weighted.npy", recipe_x_train_weighted)
 if COMPUTE_TITLE_FEATURES:
     np.save(f"{OUT}/title_x.npy", title_x)
 
@@ -365,6 +386,9 @@ stats = {
     },
     "recipe_degree": {"min": int(recipes["n_ings"].min()), "median": float(recipes["n_ings"].median()),
                       "mean": float(recipes["n_ings"].mean()), "max": int(recipes["n_ings"].max())},
+    "quantity_parsed_frac": float(is_parsed.mean()),
+    "recipe_grams": {"median": float(np.median(recipe_total)), "max": float(recipe_total.max())},
+    "edge_weight": {"median": float(np.median(edge_weight)), "max": float(edge_weight.max())},
     "top_ingredients": [[n, int(c)] for n, c in
                         ingredients.nlargest(50, "recipe_count")[["name", "recipe_count"]].values],
 }
@@ -372,6 +396,8 @@ config = {
     "slice_size": SLICE_SIZE, "min_ings": MIN_INGS, "min_ing_count": MIN_ING_COUNT,
     "drop_ingredients": sorted(DROP_INGREDIENTS), "seed": SEED, "heldout_frac": HELDOUT_FRAC,
     "val_frac": VAL_FRAC, "test_frac": TEST_FRAC, "feature_model": FEATURE_MODEL,
+    "edge_weight": "idf(train edges) * quantity share ** share_exponent",
+    "share_exponent": SHARE_EXPONENT, "properties": PROPERTIES,
 }
 with open(f"{OUT}/stats.json", "w") as f:
     json.dump(stats, f, indent=2)

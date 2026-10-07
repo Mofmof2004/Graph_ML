@@ -1,17 +1,19 @@
-# Data processing and graph construction
-numpy>=1.26.4,<2.0
-pandas
-scipy
-networkx
+# Graph construction (build_graph.py)
+numpy==2.5.3
+pandas==3.0.6
+scipy==1.18.1
+sentence-transformers==6.1.0
 
-# Embeddings
-node2vec
-sentence-transformers
+# Node2Vec baseline (random_walk_embeddings.py)
+networkx==3.7
+node2vec==0.4.3
+setuptools==80.10.2   # node2vec 0.4.3 imports pkg_resources, removed in setuptools 81
 
-# Evaluation notebook
-matplotlib
-scikit-learn
-ipykernel
+# GAT + GraphSAGE model (train_gat.py)
+torch==2.14.1
+torch-geometric==2.8.0.post1
 
-# Dataset download
-kagglehub
+# Evaluation notebook (evaluate_embeddings.ipynb)
+matplotlib==3.11.2
+scikit-learn==1.9.1
+ipykernel==7.4.0

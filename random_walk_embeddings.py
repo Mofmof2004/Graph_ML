@@ -12,6 +12,7 @@ from node2vec import Node2Vec
 
 DATA_DIR = Path("data/processed")
 SPLIT = "train"
+WEIGHTED = True      # walk along edges with probability proportional to the edge weight from build_graph.py
 OUTPUT = Path("data/node2vec")
 DIMENSIONS = 32
 WALK_LENGTH = 10
@@ -24,16 +25,30 @@ EPOCHS = 5
 SEED = 0
 
 
-def load_graph(data_dir, split):
+def recipe_node(recipe_id):
+	return f"r{recipe_id}"
+
+
+def ingredient_node(ingredient_id):
+	return f"i{ingredient_id}"
+
+
+def load_graph(data_dir, split, weighted):
 	edges = np.load(data_dir / "edges.npz")
 	recipes = pd.read_csv(data_dir / "recipes.csv")
 	ingredients = pd.read_csv(data_dir / "ingredients.csv")
 
+	# Nodes are named by id, not title: many recipes share a title, and a recipe
+	# called "Butter" would otherwise merge with the ingredient butter
 	edge_index = edges[split]
+	if weighted:
+		weights = np.load(data_dir / "edge_weights.npz")[split]
+	else:
+		weights = np.ones(edge_index.shape[1])
 	graph = nx.Graph()
-	graph.add_edges_from(
-		(recipes.iloc[recipe_id]['title'], ingredients.iloc[ingredient_id]['name'])
-		for recipe_id, ingredient_id in edge_index.T
+	graph.add_weighted_edges_from(
+		(recipe_node(recipe_id), ingredient_node(ingredient_id), float(weight))
+		for (recipe_id, ingredient_id), weight in zip(edge_index.T, weights)
 	)
 	return graph, recipes, ingredients
 
@@ -72,11 +87,11 @@ def collect_embeddings(model, labels, dimensions):
 def main():
 	np.random.seed(SEED)
 
-	graph, recipes, ingredients = load_graph(DATA_DIR, SPLIT)
+	graph, recipes, ingredients = load_graph(DATA_DIR, SPLIT, WEIGHTED)
 	model = train_embeddings(graph)
 
-	recipe_labels = recipes['title']
-	ingredient_labels = ingredients['name']
+	recipe_labels = [recipe_node(i) for i in recipes['recipe_id']]
+	ingredient_labels = [ingredient_node(i) for i in ingredients['ingredient_id']]
 	recipe_embeddings, recipe_present = collect_embeddings(
 		model, recipe_labels, DIMENSIONS
 	)
@@ -84,7 +99,7 @@ def main():
 		model, ingredient_labels, DIMENSIONS
 	)
 
-	output = OUTPUT / f"node2vec_{SPLIT}.npz"
+	output = OUTPUT / f"node2vec_{SPLIT}{'_weighted' if WEIGHTED else ''}.npz"
 	output.parent.mkdir(parents=True, exist_ok=True)
 	np.savez_compressed(
 		output,
@@ -96,6 +111,7 @@ def main():
 
 	metadata = {
 		"split": SPLIT,
+		"weighted": WEIGHTED,
 		"dimensions": DIMENSIONS,
 		"walk_length": WALK_LENGTH,
 		"num_walks": NUM_WALKS,

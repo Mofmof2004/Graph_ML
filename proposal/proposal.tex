@@ -1,0 +1,104 @@
+\documentclass{article}
+\usepackage{graphicx} % Required for inserting images
+\usepackage{url}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+
+\title{GraphML Project Proposal: Semantic Graph Attention Networks for Recipe Similarity}
+\author{Martin Angelov, Hristo Bizhev, Martin Damyanov,\\ Théophile Guillet, Kaloyan Yanchev}
+\date{September 2026}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+Food is a cultural artifact that reflects geography, climate, trade history, and social exchange between civilizations. Understanding how cuisines relate to each other at a deeper level than surface-level similarity can reveal historical connections and cultural influences. Currently, culinary science lacks automated methods to discover non-obvious relationships between recipes across different origins. When a chef wants to understand what ingredients and techniques link Italian pasta dishes to Asian noodle dishes, or how African stews relate to South Asian curries, human expertise is required. An automatic graph-based approach can scale this understanding across thousands of recipes and origins, potentially uncovering hidden culinary relationships and validating known cultural food exchanges.
+
+We propose a novel graph-based approach to detect similarity between recipes by leveraging textual information to maintain similarities. For example, swapping out paprika for chilli powder will likely not change the recipe much and this might not be easy to detect without capturing the semantics of the two ingredients. 
+
+Let the set of recipes be represented by $\mathcal{R}$ and the set of ingredients by $\mathcal{I}$. The set of vertices of the graph $G = (V, E)$ is then $V = \mathcal{R} \cup \mathcal{I}$. The graph is bipartite and undirected and there is an edge $(r, i) \in E$, $E \subseteq (\mathcal{R} \times \mathcal{I})$ if ingredient $i$ is contained in recipe $r$. To further capture similarities between ingredients and recipes, we assign each node $n \in V$ a feature vector in the following way: if $n \in \mathcal{I}$, then the feature of that node is the Word2Vec embedding of the ingredient it represents. If $n \in \mathcal{R}$, we assign $n$ a feature that is the aggregate of the features of all of its embeddings. That is, we aggregate the embeddings of its ingredients in some way. For edge weights we will use attention - this will capture how much importance a certain ingredient has in a recipe.
+
+This graph is designed specifically to detect semantic similarity between recipes. Prior approaches to recipe similarity have focused primarily on shared ingredients \cite{bellingeri_recipe_2025,kular_using_2011} or shared flavor profiles \cite{ahn_flavor_2011,simas_food-bridging_2017}. None of these capture the semantic meaning an ingredient contributes to a dish. Instead, they rely on purely structural similarities between recipes.
+
+A second line of work develops food embeddings for deep learning models. Salvador et al. \cite{salvador2017learning} combine a recurrent neural network with an autoencoder to learn a joint embedding space for food images and cooking recipes. Pellegrini et al. \cite{pellegrini_exploiting_2021} later introduce a BERT-based transformer architecture \cite{devlin_bert_2019} for ingredient substitution in recipes. While powerful, these approaches do not leverage the structural composition of a recipe directly, but only approximate it through learned representations.
+
+A third line of work combines GNNs with NLP methods through Text-Attributed Graphs \cite{yan_comprehensive_nodate}. These models leverage both the expressiveness of language models and the structural topology preserved by GNN methods.
+
+This leaves a genuine gap in the literature: no existing approach produces food embeddings that are both semantically grounded and structurally faithful to the recipe itself. We address this gap by adapting a TAG-based approach to the recipe domain, producing food embeddings that capture the semantic contribution of each ingredient while preserving the structural composition of the recipe as a graph. 
+
+This raises our central research question: \textbf {Can the structural information encoded in a graph neural network outperform state-of-the-art embedding models that rely on language alone?} More specifically, is the structure of a recipe, the relationships between ingredients, an essential signal for similarity, or can it be approximated by language models without explicit structural grounding?
+
+
+
+\section{Methodology} 
+
+We will implement a simple random-walk-based algorithm as a baseline and a Graph Attention Network (GAT) for measuring recipe similarity. For the random-walk baseline, we will use Node2Vec to learn recipe representations from the graph structure. Node2Vec generates random walks over the graph and uses the resulting node sequences to learn low-dimensional embeddings with the Skip-gram objective. Node2Vec serves as our structure-only baseline. It learns embeddings purely from the topology of the bipartite recipe–ingredient graph with no access to the Word2Vec-derived semantic features used by our GAT model. This makes it a useful control - if our full model substantially outperforms Node2Vec, we can attribute the gain specifically to the injected ingredient semantics and attention mechanism, rather than to graph structure alone. As a language-only baseline we also embed each recipe's ingredient list with a pretrained sentence transformer. This model captures ingredient semantics but has no access to the graph, so comparing it with our GAT directly addresses our research question. We also include Jaccard similarity over ingredient sets, which represents the shared-ingredient approaches of prior work \cite{bellingeri_recipe_2025,kular_using_2011}.
+
+We will use a hybrid GNN encoder with a graph attention layer followed by a  \textbf{GraphSAGE} layer. The attention layer learns how to weight messages between recipes and ingredients by computing the attention score
+
+$$\alpha_{ri} = \text{softmax}_i\Big(\sigma\big(\mathbf{a}^\top [W h_r \, \| \, W h_i]\big)\Big) = \frac{\exp\big(\sigma(\mathbf{a}^\top [W h_r \, \| \, W h_i])\big)}{\sum_{i' \in \mathcal{N}(r)} \exp\big(\sigma(\mathbf{a}^\top [W h_r \, \| \, W h_{i'}])\big)}$$
+
+Here $h_i$ is the word2vec embedding of an ingredient node and $h_r$ is the feature vector of a recipe node, achieved by aggregating the initial embeddings of all neighbours of the recipe node. This could be achieved for example by taking the mean of the ingredient embeddings in the recipe. 
+ 
+% GraphSAGE then aggregates the resulting node representations from each node’s neighborhood to produce recipe embeddings. The resulting recipe embeddings can then be compared using a similarity measure such as cosine similarity to determine the similarity between recipes.
+
+% \textbf{They want description of the algorithms with equations and figures, add that too}
+
+% We will use the RecipeNLG dataset\footnote{\url{https://www.kaggle.com/datasets/saldenisov/recipenlg}}, an extension of the Recipe1M dataset \cite{marin2019learning,salvador2017learning}. The dataset contains more than two million recipes, including their ingredients and corresponding preparation instructions. Its large scale makes it well suited for our experiments, allowing us to evaluate and compare the proposed algorithms extensively across a substantial collection of recipes. Preprocessing will mostly include normalization of ingredients, removal of duplicate (or near duplicate recipes) and the construction of the graph as outlined above. 
+
+% \subsection{GraphSAGE Layer}
+
+GraphSAGE aggregates feature information from a node's local neighborhood and combines it with the node's own representation to produce an updated embedding. At each layer, a node samples or gathers its neighbors' current-layer representations, aggregates them with a permutation-invariant function (mean, pooling, or LSTM-based), and concatenates the result with its own previous-layer representation before passing it through a learned linear transformation and nonlinearity. Stacking $k$ such layers lets a node's final embedding incorporate information from neighbors up to $k$ hops away.
+
+For layer $k$, the update for node $v$ is:
+
+$$h_{\mathcal{N}(v)}^{(k)} = \operatorname{AGGREGATE}_k\left(\{h_u^{(k-1)} : u \in \mathcal{N}(v)\}\right)$$
+
+$$h_v^{(k)} = \sigma\left(W^{(k)} \cdot \operatorname{CONCAT}\left(h_v^{(k-1)}, h_{\mathcal{N}(v)}^{(k)}\right)\right)$$
+
+$$h_v^{(k)} \leftarrow \frac{h_v^{(k)}}{\|h_v^{(k)}\|_2}$$
+
+where $\mathcal{N}(v)$ is the (sampled) neighborhood of $v$, $h_v^{(0)}$ is the input feature of $v$ (in our case, the output of the preceding attention layer), $W^{(k)}$ is a learned weight matrix for layer $k$, and $\sigma$ is a nonlinearity such as ReLU. The final row, an $\ell_2$ normalization, stabilizes training across nodes with very different neighborhood sizes, which is relevant here since ingredient nodes (e.g. salt) can have degree orders of magnitude larger than typical recipe nodes. We use the original GraphSAGE training objective, link prediction loss
+
+$$\mathcal{L}_{\text{link}} = -\log\sigma\left(z_r^\top z_i\right) - Q \cdot \mathbb{E}_{i_n \sim P_n}\left[\log\sigma\left(-z_r^\top z_{i_n}\right)\right]$$
+
+This objective encourages the embeddings $z_r$ and $z_i$ of nodes connected by an observed recipe–ingredient edge to be close in the embedding space, while pushing apart embeddings of pairs sampled from the negative distribution $P_n$, which are unlikely to co-occur in the graph. Since it only requires the graph's own edge structure as supervision, this loss can be optimized without any labeled data, making it a natural unsupervised training signal for learning recipe and ingredient representations.
+
+We will use the RecipeNLG dataset\footnote{\url{https://www.kaggle.com/datasets/saldenisov/recipenlg}}, an extension of the Recipe1M dataset \cite{marin2019learning,salvador2017learning}. The dataset contains more than two million recipes, including their ingredients and corresponding preparation instructions. Its large scale makes it well suited for our experiments, allowing us to evaluate and compare the proposed algorithms extensively across a substantial collection of recipes. Preprocessing will mostly include normalization of ingredients, removal of duplicate (or near duplicate recipes) and the construction of the graph as outlined above.
+
+\section{Evaluation}
+% Ablation on the graph we constructed (try with different graph). Checking historical context for different recipes (manually or with LLM). 
+Our experiments address the central research question: does the structure of a recipe provide additional information about similarity beyond that captured by language models?
+
+\subsection{Recipe Similarity}
+To test the example from Section 1, we created two copies of each test recipe. In one, an ingredient is replaced by a plausible substitute such as paprika with chilli powder and in the other by a random ingredient. This will test whether the model captured the ingredients' semantics by placing the first copy closer to the original.  The substitutes come from a curated set such as Recipe1MSubs, rather than from Word2Vec neighbours, which would favour our model by design.
+
+\subsection{Cross-Cuisine Relationship}
+To validate known cultural food exchanges, we will compile a set of documented examples of dishes where one dish ($X$) is derived from another ($Y$) of a different cuisine. For example, vindaloo is derived from the Portuguese dish carne de vinha d'alhos. We extract candidates from Wikipedia articles about dishes and we also add negative pairs with high ingredient overlap and no documented connection. Each dish is represented by the average embedding of its associated recipes. We report mean reciprocal rank and hits at k for ranking Y given X, and ROC-AUC for separating positive from negative pairs, split by ingredient overlap, since related dishes often diverge through local substitutions.
+
+\subsection{Baselines and Ablations}
+We compare our results with those from the structure-only control Node2Vec and the language-only model, which is a pretrained sentence transformer applied to the ingredient list, both of which are discussed in Section 2. We also include Jaccard similarity over ingredient sets [2, 4]. We perform ablation by replacing Word2Vec features with random vectors, replacing attention with mean aggregation and removing all edges, so that an MLP is applied to the node features alone. If the MLP matches the GAT, this suggests that the recipe structure is not an essential signal.
+
+\section{Challenges}
+
+\paragraph{Interpretability.}
+Our main graph learning challenge is determining whether a high score
+reflects a meaningful ingredient relationship or merely common
+ingredients such as salt. For selected retrieved pairs, we will remove
+or replace one ingredient at a time, update both the graph and recipe
+features and measure the change in similarity. We will inspect whether
+the influential ingredients correspond to documented adaptations where
+the historical source provides that detail.
+
+\paragraph{Scalability and fair comparison.}
+The complete recipe-ingredient graph may be too large for full-graph
+training. We will use a documented, reproducible subset. Synthetic recipe variants create new graph nodes. Because Node2Vec cannot embed unseen nodes without an additional procedure, we will define the same evaluation graph and information
+available to each method before comparing their results.
+
+\bibliographystyle{plain} 
+\bibliography{bibliography}
+
+\end{document}
+
