@@ -205,9 +205,12 @@ def embed_recipes(model, g, lists, weights, batch=20000):
 
 
 if __name__ == "__main__":
-    # usage: python train_gat.py [name layer1 edge_weights seed], e.g. gat_w gat 1 0
+    # usage: python train_gat.py [name layer1 edge_weights seed [steps]]
     if len(sys.argv) > 1:
         name, layer1, ew, seed = sys.argv[1], sys.argv[2], bool(int(sys.argv[3])), int(sys.argv[4])
+        if len(sys.argv) > 5:
+            STEPS = int(sys.argv[5])
+            EVAL_EVERY = min(EVAL_EVERY, STEPS)
         train(name, layer1, ew, seed)
     else:
         train(f"{LAYER1}{'_w' if USE_EDGE_WEIGHTS else ''}_s{SEED}")

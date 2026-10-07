@@ -15,7 +15,7 @@ import pandas as pd
 from normalisation import normalise
 
 SUBS_DIR = "data/eval/recipe1msubs"
-MANUAL = "substitutions.csv"
+MANUAL = "data/substitutions.csv"
 INGREDIENTS = "data/processed/ingredients.csv"
 OUTPUT = "data/eval/substitutions_all.csv"
 MIN_SUPPORT = 3   # a pair must appear in at least this many comments; at 2, pairs like eggplant -> pasta remain

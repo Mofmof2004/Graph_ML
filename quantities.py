@@ -10,7 +10,7 @@ import re
 
 import pandas as pd
 
-PROPERTIES = "ingredient_properties.csv"
+PROPERTIES = "data/ingredient_properties.csv"
 
 # Grams per unit
 MASS = {

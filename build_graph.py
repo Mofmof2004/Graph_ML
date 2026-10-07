@@ -28,7 +28,7 @@ PRINT_DATA_NORMALISATION = True
 
 FEATURE_MODEL = "all-mpnet-base-v2"   # small, fast text model, 384 numbers per text
 COMPUTE_TITLE_FEATURES = True        # also embed recipe titles, as an optional extra
-PROPERTIES = "ingredient_properties.csv"   # density (g/ml), piece and package weight per ingredient
+PROPERTIES = "data/ingredient_properties.csv"   # density (g/ml), piece and package weight per ingredient
 SHARE_EXPONENT = 0.5   # edge weight = idf * share ** SHARE_EXPONENT; 1 = linear share, 0 = idf only
 
 
