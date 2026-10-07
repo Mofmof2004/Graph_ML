@@ -8,7 +8,7 @@ import pandas as pd
 from scipy.sparse import csr_matrix
 from sentence_transformers import SentenceTransformer
 
-RAW = "data/raw/full_dataset.csv"
+RAW = "data/raw/RecipeNLG_dataset.csv"
 OUT = "data/interim"
 SLICE_SIZE = 10_000          # number of rows read from the CSV
 MIN_INGS = 2

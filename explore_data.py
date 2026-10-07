@@ -1,7 +1,7 @@
 import pandas as pd
 import json
 
-df = pd.read_csv("data/raw/full_dataset.csv", nrows=1000,
+df = pd.read_csv("data/raw/RecipeNLG_dataset.csv", nrows=1000,
                  usecols=["title", "ingredients", "directions", "link", "source", "NER"])
 
 print(df.shape)

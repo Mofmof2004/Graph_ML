@@ -1,0 +1,17 @@
+# Data processing and graph construction
+numpy>=1.26.4,<2.0
+pandas
+scipy
+networkx
+
+# Embeddings
+node2vec
+sentence-transformers
+
+# Evaluation notebook
+matplotlib
+scikit-learn
+ipykernel
+
+# Dataset download
+kagglehub
