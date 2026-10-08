@@ -30,6 +30,9 @@ DEFAULT_STEPS = 1000
 EVAL_EVERY = 50
 POSITIVE_JACCARD = 0.30
 NEGATIVE_JACCARD = 0.05
+SEMANTIC_POSITIVE = 0.88
+SEMANTIC_NEGATIVE = 0.80
+PARTIAL_OVERLAP = 0.15
 EVALUATION_K = 10
 
 
@@ -62,7 +65,30 @@ def weighted_jaccard(first, second, weights):
     return numerator / denominator if denominator else 0.0
 
 
-def build_training_pairs(recipe_ids, recipe_ingredients, recipe_weights, seed):
+def semantic_similarity(first, second):
+    """Cosine similarity of weighted ingredient text representations."""
+    first_norm = np.linalg.norm(first)
+    second_norm = np.linalg.norm(second)
+    if first_norm == 0.0 or second_norm == 0.0:
+        return 0.0
+    return float(np.dot(first, second) / (first_norm * second_norm))
+
+
+def is_positive_similarity(overlap, semantic):
+    """Require overlap, while allowing strong semantic agreement to refine it."""
+    return overlap >= POSITIVE_JACCARD or (
+        overlap >= PARTIAL_OVERLAP and semantic >= SEMANTIC_POSITIVE
+    )
+
+
+def is_negative_similarity(overlap, semantic):
+    """Keep semantically related recipes out of the negative training labels."""
+    return overlap <= NEGATIVE_JACCARD and semantic <= SEMANTIC_NEGATIVE
+
+
+def build_training_pairs(
+    recipe_ids, recipe_ingredients, recipe_weights, recipe_vectors, seed
+):
     rng = np.random.default_rng(seed)
     positives, negatives = [], []
     by_ingredient = {}
@@ -81,23 +107,33 @@ def build_training_pairs(recipe_ids, recipe_ingredients, recipe_weights, seed):
                 recipe_ingredients[first], recipe_ingredients[second],
                 (recipe_weights[first], recipe_weights[second]),
             )
-            if similarity >= POSITIVE_JACCARD:
+            semantic = semantic_similarity(recipe_vectors[first], recipe_vectors[second])
+            if is_positive_similarity(similarity, semantic):
                 positive_candidates.add((min(first, second), max(first, second)))
     positives = list(positive_candidates)
 
     recipe_ids = np.asarray(recipe_ids)
     seen = set(positives)
     target = max(len(positives), 1)
-    while len(negatives) < target:
+    attempts = 0
+    max_attempts = max(target * 100, 10_000)
+    while len(negatives) < target and attempts < max_attempts:
+        attempts += 1
         first, second = rng.choice(recipe_ids, 2, replace=False)
         pair = (min(first, second), max(first, second))
         similarity = weighted_jaccard(
             recipe_ingredients[first], recipe_ingredients[second],
             (recipe_weights[first], recipe_weights[second]),
         )
-        if pair not in seen and similarity <= NEGATIVE_JACCARD:
+        semantic = semantic_similarity(recipe_vectors[first], recipe_vectors[second])
+        if pair not in seen and is_negative_similarity(similarity, semantic):
             negatives.append(pair)
             seen.add(pair)
+    if len(negatives) < target:
+        raise RuntimeError(
+            f"Could only find {len(negatives)} of {target} negative pairs after "
+            f"{max_attempts} attempts; adjust the similarity thresholds."
+        )
     return np.asarray(positives, dtype=np.int64), np.asarray(negatives, dtype=np.int64)
 
 
@@ -245,7 +281,7 @@ def pair_loss(model, embeddings, positives, negatives, lightgcn):
 @torch.no_grad()
 def evaluate(
     query_embeddings, candidate_embeddings, query_ids, candidate_ids,
-    recipe_ingredients, recipe_weights
+    recipe_ingredients, recipe_weights, recipe_vectors
 ):
     hits, reciprocal_ranks, ndcgs = [], [], []
     candidate_ids = np.asarray(candidate_ids)
@@ -253,11 +289,15 @@ def evaluate(
         similarities = query_embeddings[row] @ candidate_embeddings.T
         order = np.argsort(-similarities)
         relevant = np.array([
-            weighted_jaccard(
-                recipe_ingredients[query_id], recipe_ingredients[candidate_id],
-                (recipe_weights[query_id], recipe_weights[candidate_id]),
+            is_positive_similarity(
+                weighted_jaccard(
+                    recipe_ingredients[query_id], recipe_ingredients[candidate_id],
+                    (recipe_weights[query_id], recipe_weights[candidate_id]),
+                ),
+                semantic_similarity(
+                    recipe_vectors[query_id], recipe_vectors[candidate_id]
+                ),
             )
-            >= POSITIVE_JACCARD
             for candidate_id in candidate_ids[order]
         ])
         relevant_count = int(relevant.sum())
@@ -291,9 +331,18 @@ def train(model_name, steps, seed):
         np.load(DATA_DIR / "edge_weights.npz")["train"]
     ).float().to(device)
     recipe_x = recipe_features(train_edge_index, ingredient_x, n_recipes, train_weight_values)
+    all_weight_values = torch.from_numpy(
+        np.load(DATA_DIR / "edge_weights.npz")["all"]
+    ).float().to(device)
+    recipe_vectors = recipe_features(
+        torch.from_numpy(all_edges).long().to(device),
+        ingredient_x,
+        n_recipes,
+        all_weight_values,
+    ).cpu().numpy()
     graph_edges = bidirectional_edges(train_edge_index, n_recipes)
     train_pairs, negatives = build_training_pairs(
-        train_ids, recipe_ingredients, recipe_weights, seed
+        train_ids, recipe_ingredients, recipe_weights, recipe_vectors, seed
     )
     if len(train_pairs) == 0:
         raise RuntimeError("No positive ingredient-similarity pairs were found.")
@@ -350,6 +399,7 @@ def train(model_name, steps, seed):
         train_ids,
         recipe_ingredients,
         recipe_weights,
+        recipe_vectors,
     )
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     config = {
@@ -358,6 +408,9 @@ def train(model_name, steps, seed):
         "steps": steps,
         "positive_weighted_jaccard": POSITIVE_JACCARD,
         "negative_weighted_jaccard": NEGATIVE_JACCARD,
+        "partial_overlap_for_semantic_positive": PARTIAL_OVERLAP,
+        "semantic_positive_cosine": SEMANTIC_POSITIVE,
+        "semantic_negative_cosine": SEMANTIC_NEGATIVE,
         "heldout_queries": len(test_ids),
         "metrics": metrics,
     }

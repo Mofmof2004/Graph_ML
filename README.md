@@ -95,10 +95,14 @@ python train_gat.py gat_w_smoke gat 1 0 20
 For the inductive recipe-similarity task, similarity is defined from ingredient
 sets rather than recipe names. The model trains on non-held-out recipes, then
 embeds held-out recipes from their ingredient lists and retrieves similar
-training recipes. a pair is relevant when its weighted ingredient Jaccard similarity is at least
-0.30. The weights are the same IDF and quantity-share weights used by graph
-construction, so common ingredients such as salt contribute less. The
-evaluation reports MRR, Hits@10, and NDCG@10.
+training recipes. A pair is relevant when its weighted ingredient Jaccard similarity is at least 0.30, or
+when it has at least 0.15 weighted overlap and at least 0.88 cosine similarity
+between weighted ingredient-text vectors. Negative training pairs must have at
+most 0.05 weighted Jaccard and at most 0.80 semantic cosine similarity. The
+weights are the same IDF and quantity-share weights used by graph construction,
+so common ingredients such as salt contribute less. They are normalized per
+recipe when constructing feature means; edge values themselves are not
+globally normalized. The evaluation reports MRR, Hits@10, and NDCG@10.
 
 LightGCN-style propagation uses the recipe/ingredient graph and projected
 ingredient features, so it can embed a new recipe:
