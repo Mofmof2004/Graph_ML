@@ -290,8 +290,14 @@ def train(model_name, steps, seed):
     train_weight_values = torch.from_numpy(
         np.load(DATA_DIR / "edge_weights.npz")["train"]
     ).float().to(device)
+
+    # TODO
+    # This is a weighted sum of the ingredient embeddings, we have sentence transformer features for that
     recipe_x = recipe_features(train_edge_index, ingredient_x, n_recipes, train_weight_values)
     graph_edges = bidirectional_edges(train_edge_index, n_recipes)
+
+    #TODO
+    #This just samples training pairs before the training and uses them. Not sure if best approach
     train_pairs, negatives = build_training_pairs(
         train_ids, recipe_ingredients, recipe_weights, seed
     )
@@ -315,6 +321,9 @@ def train(model_name, steps, seed):
     for step in range(1, steps + 1):
         model.train()
         embeddings = model()
+
+        # TODO
+        # Losses are questionable
         loss = pair_loss(model, embeddings, positive_tensor, negative_tensor, lightgcn)
         optimizer.zero_grad()
         loss.backward()
