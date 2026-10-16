@@ -17,7 +17,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import SAGEConv
+from torch_geometric.nn import GCNConv
 
 
 DATA_DIR = Path("data/processed")
@@ -158,66 +158,16 @@ def bidirectional_edges(edge_index, n_recipes):
     return torch.cat([torch.stack([src, dst]), torch.stack([dst, src])], dim=1)
 
 
-class FeatureLightGCN(nn.Module):
-    """LightGCN-style propagation whose recipe embeddings are feature-derived."""
-
-    def __init__(self, recipe_x, ingredient_x, graph_edges, n_recipes):
-        super().__init__()
-        self.n_recipes = n_recipes
-        self.register_buffer("recipe_x", recipe_x)
-        self.register_buffer("ingredient_x", ingredient_x)
-        self.register_buffer("graph_edges", graph_edges)
-        self.projection = nn.Linear(recipe_x.shape[1], EMBEDDING_DIM)
-
-    def _propagate(self, x, edge_index):
-        src, dst = edge_index
-        degree = torch.bincount(
-            torch.cat([src, dst]), minlength=x.shape[0]
-        ).float().clamp(min=1)
-        norm = (degree[src] * degree[dst]).rsqrt()
-        states = [x]
-        for _ in range(LAYERS):
-            message = torch.zeros_like(x)
-            message.index_add_(0, dst, x[src] * norm.unsqueeze(1))
-            message.index_add_(0, src, x[dst] * norm.unsqueeze(1))
-            x = message
-            states.append(x)
-        return torch.stack(states).mean(0)
-
-    def forward(self):
-        x = self.projection(torch.cat([self.recipe_x, self.ingredient_x]))
-        return F.normalize(self._propagate(x, self.graph_edges)[:self.n_recipes], dim=1)
-
-    def embed_new(self, recipe_x, ingredient_ids, ingredient_weights):
-        ingredient_z = self.projection(self.ingredient_x)
-        recipe_z = self.projection(recipe_x)
-        messages = []
-        for row, ids in enumerate(ingredient_ids):
-            if ids:
-                ids = list(ids)
-                weights = torch.tensor(
-                    [ingredient_weights[row][ingredient_id] for ingredient_id in ids],
-                    device=recipe_x.device,
-                )
-                messages.append(
-                    (ingredient_z[ids] * weights.unsqueeze(1)).sum(0)
-                    / weights.sum().clamp(min=1e-12)
-                )
-            else:
-                messages.append(torch.zeros_like(recipe_z[row]))
-        return F.normalize(recipe_z + torch.stack(messages), dim=1)
-
-
-class GraphSAGEPairModel(nn.Module):
+class GCNPairModel(nn.Module):
     def __init__(self, node_x, graph_edges, n_recipes):
         super().__init__()
         self.n_recipes = n_recipes
         self.register_buffer("node_x", node_x)
         self.register_buffer("graph_edges", graph_edges)
-        self.conv1 = SAGEConv(node_x.shape[1], HIDDEN)
-        self.conv2 = SAGEConv(HIDDEN, EMBEDDING_DIM)
+        self.conv1 = GCNConv(node_x.shape[1], HIDDEN)
+        self.conv2 = GCNConv(HIDDEN, EMBEDDING_DIM)
         self.decoder = nn.Sequential(
-            nn.Linear(EMBEDDING_DIM * 4, HIDDEN),
+            nn.Linear(EMBEDDING_DIM * 2, HIDDEN),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(HIDDEN, 1),
@@ -235,14 +185,14 @@ class GraphSAGEPairModel(nn.Module):
     def score(self, embeddings, pairs):
         first, second = embeddings[pairs[:, 0]], embeddings[pairs[:, 1]]
         features = torch.cat(
-            [first, second, first * second, (first - second).abs()], dim=1
+            [first, second], dim=1
         )
         return self.decoder(features).squeeze(1)
 
+    # TODO this does not use edge weights from file, add them
     def embed_new(self, recipe_x, ingredient_ids, train_embeddings):
         recipe_x = recipe_x.to(self.node_x.device)
         n_existing = self.node_x.shape[0]
-        n_new = recipe_x.shape[0]
         rows = []
         cols = []
         for row, ids in enumerate(ingredient_ids):
@@ -261,23 +211,16 @@ class GraphSAGEPairModel(nn.Module):
         return z[n_existing:]
 
 
-def pair_loss(model, embeddings, positives, negatives, lightgcn):
-    positive_scores = (
-        (embeddings[positives[:, 0]] * embeddings[positives[:, 1]]).sum(1)
-        if lightgcn else model.score(embeddings, positives)
-    )
-    negative_scores = (
-        (embeddings[negatives[:, 0]] * embeddings[negatives[:, 1]]).sum(1)
-        if lightgcn else model.score(embeddings, negatives)
-    )
-    if lightgcn:
-        return F.relu(0.2 - positive_scores + negative_scores).mean()
+def pair_loss(model, embeddings, positives, negatives):
+    positive_scores = model.score(embeddings, positives)
+    negative_scores = model.score(embeddings, negatives)
     return F.binary_cross_entropy_with_logits(
         torch.cat([positive_scores, negative_scores]),
         torch.cat([torch.ones_like(positive_scores), torch.zeros_like(negative_scores)]),
     )
 
 
+# TODO this eval is bad, use our other eval metrics
 @torch.no_grad()
 def evaluate(
     query_embeddings, candidate_embeddings, query_ids, candidate_ids,
@@ -327,22 +270,11 @@ def train(model_name, steps, seed):
     train_ids = np.flatnonzero(~heldout)
     test_ids = np.flatnonzero(heldout)
     n_recipes = len(recipe_ingredients)
-    train_weight_values = torch.from_numpy(
-        np.load(DATA_DIR / "edge_weights.npz")["train"]
-    ).float().to(device)
 
-    # TODO
-    # This is a weighted sum of the ingredient embeddings, we have sentence transformer features for that
-    recipe_x = recipe_features(train_edge_index, ingredient_x, n_recipes, train_weight_values)
-    all_weight_values = torch.from_numpy(
-        np.load(DATA_DIR / "edge_weights.npz")["all"]
+    recipe_x = torch.from_numpy(
+        np.load(DATA_DIR / "recipe_x_train_weighted.npy")
     ).float().to(device)
-    recipe_vectors = recipe_features(
-        torch.from_numpy(all_edges).long().to(device),
-        ingredient_x,
-        n_recipes,
-        all_weight_values,
-    ).cpu().numpy()
+    recipe_vectors = np.load(DATA_DIR / "recipe_x_full_weighted.npy")
     graph_edges = bidirectional_edges(train_edge_index, n_recipes)
 
     #TODO
@@ -353,16 +285,12 @@ def train(model_name, steps, seed):
     if len(train_pairs) == 0:
         raise RuntimeError("No positive ingredient-similarity pairs were found.")
 
-    if model_name == "lightgcn":
-        model = FeatureLightGCN(recipe_x, ingredient_x, graph_edges, n_recipes).to(device)
-        lightgcn = True
-    elif model_name == "graphsage":
-        model = GraphSAGEPairModel(
-            torch.cat([recipe_x, ingredient_x]), graph_edges, n_recipes
-        ).to(device)
-        lightgcn = False
-    else:
-        raise ValueError("model must be lightgcn or graphsage")
+    if model_name != "gcn":
+        raise ValueError("model must be gcn")
+
+    model = GCNPairModel(
+        torch.cat([recipe_x, ingredient_x]), graph_edges, n_recipes
+    ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
     positive_tensor = torch.from_numpy(train_pairs).long().to(device)
@@ -371,9 +299,7 @@ def train(model_name, steps, seed):
         model.train()
         embeddings = model()
 
-        # TODO
-        # Losses are questionable
-        loss = pair_loss(model, embeddings, positive_tensor, negative_tensor, lightgcn)
+        loss = pair_loss(model, embeddings, positive_tensor, negative_tensor)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -383,24 +309,12 @@ def train(model_name, steps, seed):
     model.eval()
     with torch.no_grad():
         train_embeddings = model().cpu().numpy()
-        heldout_features = recipe_features(
-            torch.from_numpy(all_edges[:, heldout[all_edges[0]]]).long().to(device),
-            ingredient_x,
-            n_recipes,
-            torch.from_numpy(
-                np.load(DATA_DIR / "edge_weights.npz")["heldout"]
-            ).float().to(device),
-        )[test_ids]
+        heldout_features = recipe_x[test_ids]
         heldout_lists = [recipe_ingredients[recipe_id] for recipe_id in test_ids]
         heldout_weights = [recipe_weights[recipe_id] for recipe_id in test_ids]
-        if lightgcn:
-            test_embeddings = model.embed_new(
-                heldout_features, heldout_lists, heldout_weights
-            ).cpu().numpy()
-        else:
-            test_embeddings = model.embed_new(
-                heldout_features, heldout_lists, train_embeddings
-            ).cpu().numpy()
+        test_embeddings = model.embed_new(
+            heldout_features, heldout_lists, train_embeddings
+        ).cpu().numpy()
     metrics = evaluate(
         test_embeddings,
         train_embeddings[train_ids],
@@ -411,6 +325,19 @@ def train(model_name, steps, seed):
         recipe_vectors,
     )
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    embedding_recipe_ids = np.concatenate([train_ids, test_ids])
+    embedding_values = np.concatenate(
+        [train_embeddings[train_ids], test_embeddings], axis=0
+    )
+    embedding_order = np.argsort(embedding_recipe_ids)
+    np.savez(
+        OUTPUT_DIR / f"{model_name}_inductive_s{seed}_embeddings.npz",
+        embeddings=embedding_values[embedding_order],
+        recipe_id=embedding_recipe_ids[embedding_order],
+        split=np.where(
+            heldout[embedding_recipe_ids[embedding_order]], "test", "train"
+        ),
+    )
     config = {
         "model": model_name,
         "seed": seed,
@@ -433,7 +360,7 @@ def train(model_name, steps, seed):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("model", choices=["lightgcn", "graphsage"])
+    parser.add_argument("model", choices=["gcn"], default="gcn", nargs="?")
     parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
     parser.add_argument("--seed", type=int, default=SEED)
     args = parser.parse_args()

@@ -4,11 +4,12 @@ import re
 from collections import Counter, defaultdict
 import numpy as np
 import pandas as pd
-from scipy.sparse import csr_matrix
-from sentence_transformers import SentenceTransformer
+
 
 from normalisation import normalise, norm_title
 from quantities import Properties, recipe_grams
+
+from eval_common import encode_words, calculate_edge_weights
 
 RAW = "data/raw/RecipeNLG_dataset.csv"
 OUT = "data/interim"
@@ -21,12 +22,11 @@ CHECK_KEYWORDS = ["vindaloo", "carbonara", "paella", "goulash"]  # placeholder u
 
 SEED = 0
 HELDOUT_FRAC = 0.05   # fraction of recipes reserved for the substitution benchmark
-VAL_FRAC = 0.10       # fraction of the remaining edges used for validation
-TEST_FRAC = 0.10      # fraction of the remaining edges used for testing
+VAL_FRAC = 0.10       # fraction of the non-heldout recipes used for validation
+TEST_FRAC = 0.10      # fraction of the non-heldout recipes used for testing
 
 PRINT_DATA_NORMALISATION = True
 
-FEATURE_MODEL = "all-mpnet-base-v2"   # small, fast text model, 384 numbers per text
 COMPUTE_TITLE_FEATURES = True        # also embed recipe titles, as an optional extra
 PROPERTIES = "data/ingredient_properties.csv"   # density (g/ml), piece and package weight per ingredient
 SHARE_EXPONENT = 0.5   # edge weight = idf * share ** SHARE_EXPONENT; 1 = linear share, 0 = idf only
@@ -220,34 +220,29 @@ print(f"example: {recipes.loc[example, 'title']!r}")
 for k in np.flatnonzero(edge_index[0] == example):
     print(f"  {ingredient_names[edge_index[1, k]]:20s} {edge_grams[k]:7.1f} g  share {edge_share[k]:.2f}")
 
-#----------Edge Splits----------#
+#----------Recipe Splits----------#
 
 rng = np.random.default_rng(SEED)
 n_recipes = len(recipes)
 n_edges = edge_index.shape[1]
 
-# Held-out recipes: all their edges go to the heldout split
-heldout_recipes = rng.choice(n_recipes, size=int(HELDOUT_FRAC * n_recipes), replace=False)
-recipes["heldout"] = recipes["recipe_id"].isin(heldout_recipes)
-is_heldout = np.isin(edge_index[0], heldout_recipes)
+# Assign recipes, rather than individual edges, to each split. Every edge of a
+# recipe follows that recipe, so no recipe can occur in more than one split.
+recipe_order = rng.permutation(n_recipes)
+n_heldout = int(HELDOUT_FRAC * n_recipes)
+n_val = int(VAL_FRAC * (n_recipes - n_heldout))
+n_test = int(TEST_FRAC * (n_recipes - n_heldout))
 
-heldout_idx = np.flatnonzero(is_heldout)      # positions of heldout edges
-remaining = np.flatnonzero(~is_heldout)       # positions of all other edges
+heldout_recipes = recipe_order[:n_heldout]
+val_recipes = recipe_order[n_heldout:n_heldout + n_val]
+test_recipes = recipe_order[n_heldout + n_val:n_heldout + n_val + n_test]
+train_recipes = recipe_order[n_heldout + n_val + n_test:]
 
-# Pick one edge per recipe and one per ingredient that must stay in train
-shuffled = rng.permutation(remaining)
-_, first_per_recipe = np.unique(edge_index[0, shuffled], return_index=True)
-_, first_per_ing = np.unique(edge_index[1, shuffled], return_index=True)
-must_train = np.union1d(shuffled[first_per_recipe], shuffled[first_per_ing])
-
-# Split the other edges randomly into val, test and the rest of train
-others = rng.permutation(np.setdiff1d(remaining, must_train))
-n_val = int(VAL_FRAC * len(remaining))
-n_test = int(TEST_FRAC * len(remaining))
-
-val_idx = others[:n_val]
-test_idx = others[n_val:n_val + n_test]
-train_idx = np.concatenate([must_train, others[n_val + n_test:]])
+recipes["heldout"] = np.isin(recipes["recipe_id"], heldout_recipes)
+train_idx = np.flatnonzero(np.isin(edge_index[0], train_recipes))
+val_idx = np.flatnonzero(np.isin(edge_index[0], val_recipes))
+test_idx = np.flatnonzero(np.isin(edge_index[0], test_recipes))
+heldout_idx = np.flatnonzero(np.isin(edge_index[0], heldout_recipes))
 
 splits = {
     "train": edge_index[:, train_idx],
@@ -259,30 +254,29 @@ splits = {
 # Sanity checks
 assert len(train_idx) + len(val_idx) + len(test_idx) + len(heldout_idx) == n_edges
 assert len(np.unique(np.concatenate([train_idx, val_idx, test_idx, heldout_idx]))) == n_edges
-non_heldout_recipes = recipes.loc[~recipes["heldout"], "recipe_id"].to_numpy()
-assert np.isin(non_heldout_recipes, splits["train"][0]).all()
-
-ings_outside_heldout = np.unique(edge_index[1, remaining])
-assert np.isin(ings_outside_heldout, splits["train"][1]).all()
-n_only_heldout = len(ingredients) - len(ings_outside_heldout)
+split_recipe_ids = {
+    name: np.unique(edges[0]) for name, edges in splits.items()
+}
+assert not np.intersect1d(split_recipe_ids["train"], split_recipe_ids["val"]).size
+assert not np.intersect1d(split_recipe_ids["train"], split_recipe_ids["test"]).size
+assert not np.intersect1d(split_recipe_ids["train"], split_recipe_ids["heldout"]).size
+assert not np.intersect1d(split_recipe_ids["val"], split_recipe_ids["test"]).size
+assert not np.intersect1d(split_recipe_ids["val"], split_recipe_ids["heldout"]).size
+assert not np.intersect1d(split_recipe_ids["test"], split_recipe_ids["heldout"]).size
 
 print(f"\nheldout recipes: {len(heldout_recipes):,}")
 for name, e in splits.items():
-    print(f"{name:8s} {e.shape[1]:>9,} edges ({e.shape[1] / n_edges:.1%})")
-print(f"ingredients appearing only in heldout recipes: {n_only_heldout}")
+    print(f"{name:8s} {len(split_recipe_ids[name]):>9,} recipes, {e.shape[1]:>9,} edges")
 
 
 #----------Edge Weights----------#
 
-# Weight = IDF of the ingredient * its quantity share in the recipe, so rare ingredients
-# that make up much of a recipe count most, and a pinch of salt counts very little.
-# The share is compressed (square root by default): with the linear share, heavy but generic
-# bulk such as 2 qt. water or 3 c. flour dominates the recipe, which made similarity worse.
-# IDF uses the training edges only, so val/test edges do not leak into it.
-n_train_recipes = len(np.unique(splits["train"][0]))
-train_df = np.bincount(splits["train"][1], minlength=len(ingredient_names))
-idf = np.log((1 + n_train_recipes) / (1 + train_df)) + 1.0
-edge_weight = (idf[edge_index[1]] * edge_share ** SHARE_EXPONENT).astype(np.float32)
+# edge_weight, idf = calculate_edge_weights(
+#     edge_index, edge_share, idf_graph=splits["train"]
+# )
+edge_weight, idf = calculate_edge_weights(
+    edge_index, len(ingredient_names), idf_graph=splits["train"]
+)
 weight_splits = {"train": edge_weight[train_idx], "val": edge_weight[val_idx],
                  "test": edge_weight[test_idx], "heldout": edge_weight[heldout_idx]}
 
@@ -300,40 +294,24 @@ for name in ["salt", "sugar", "flour", "chicken"]:
 
 
 #----------Feature Construction----------#
-model = SentenceTransformer(FEATURE_MODEL)   # downloads the model on first run
+
+
 
 # Ingredient features: embed each ingredient name, scaled to length 1
-ingredient_x = model.encode(ingredient_names, batch_size=256,
-                            normalize_embeddings=True, show_progress_bar=True).astype(np.float32)
+ingredient_x = encode_words(ingredient_names)
 
-
-# Recipe features: mean of the ingredient features, using only the given edges.
-# With weights, a weighted mean, so the main ingredients dominate the recipe feature.
-def mean_ingredient_features(edges, weights=None):
-    if weights is None:
-        weights = np.ones(edges.shape[1], dtype=np.float32)
-    # Adjacency matrix: row = recipe, column = ingredient, edge weight where an edge exists
-    adj = csr_matrix((weights, (edges[0], edges[1])), shape=(n_recipes, len(ingredient_names)))
-    sums = adj @ ingredient_x                              # weighted sum of each recipe's ingredient vectors
-    totals = np.asarray(adj.sum(axis=1))                   # total weight per recipe
-    return (sums / np.maximum(totals, 1e-12)).astype(np.float32)
-
-
-train_edges = np.concatenate([splits["train"], splits["heldout"]], axis=1)
-train_weights = np.concatenate([weight_splits["train"], weight_splits["heldout"]])
-recipe_x_full = mean_ingredient_features(edge_index)
-recipe_x_train = mean_ingredient_features(train_edges)
-recipe_x_full_weighted = mean_ingredient_features(edge_index, edge_weight)
-recipe_x_train_weighted = mean_ingredient_features(train_edges, train_weights)
 
 if COMPUTE_TITLE_FEATURES:
-    title_x = model.encode(recipes["title"].astype(str).tolist(), batch_size=256,
-                           normalize_embeddings=True, show_progress_bar=True).astype(np.float32)
+    recipe_x = encode_words(recipes["title"].astype(str).tolist())
+    recipe_x_splits = {
+        name: recipe_x[np.unique(edges[0])].astype(np.float32)
+        for name, edges in splits.items()
+    }
 
 # Sanity check: do the ingredient features make sense?
 print("butter" in ing2id, len(ing2id), ingredient_names[:10])
 
-print(f"\ningredient_x {ingredient_x.shape}, recipe_x {recipe_x_full.shape}")
+print(f"\ningredient_x {ingredient_x.shape}, recipe_x {recipe_x.shape}")
 for name in ["paprika", "butter", "cilantro", "beef"]:
     if name in ing2id:
         sims = ingredient_x @ ingredient_x[ing2id[name]]
@@ -366,12 +344,9 @@ np.savez_compressed(f"{OUT}/edge_weights.npz", all=edge_weight, **weight_splits,
 
 # Features: one row per node id
 np.save(f"{OUT}/ingredient_x.npy", ingredient_x)
-np.save(f"{OUT}/recipe_x_full.npy", recipe_x_full)
-np.save(f"{OUT}/recipe_x_train.npy", recipe_x_train)
-np.save(f"{OUT}/recipe_x_full_weighted.npy", recipe_x_full_weighted)
-np.save(f"{OUT}/recipe_x_train_weighted.npy", recipe_x_train_weighted)
 if COMPUTE_TITLE_FEATURES:
-    np.save(f"{OUT}/title_x.npy", title_x)
+    for name, features in recipe_x_splits.items():
+        np.save(f"{OUT}/recipe_x_{name}.npy", features)
 
 # Stats for the report, and the settings used, so the graph can be rebuilt exactly
 stats = {
