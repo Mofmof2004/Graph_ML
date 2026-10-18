@@ -54,7 +54,13 @@ def load_data(device):
         positions = np.flatnonzero(all_edges[0] == recipe_id)
         recipe_weights.append(dict(zip(all_edges[1, positions], all_weights[positions])))
     train_edges = torch.from_numpy(edges["train"]).long().to(device)
-    return all_edges, train_edges, heldout, recipe_ingredients, recipe_weights, ingredient_x
+    train_edge_weights = torch.from_numpy(
+        np.load(DATA_DIR / "edge_weights.npz")["train"]
+    ).float().to(device)
+    return (
+        all_edges, train_edges, train_edge_weights, heldout,
+        recipe_ingredients, recipe_weights, ingredient_x,
+    )
 
 
 def weighted_jaccard(first, second, weights):
@@ -158,13 +164,25 @@ def bidirectional_edges(edge_index, n_recipes):
     return torch.cat([torch.stack([src, dst]), torch.stack([dst, src])], dim=1)
 
 
+def merge_graphs(
+    node_x,
+    edge_index,
+    edge_weight,
+    new_node_x,
+    new_edge_index,
+    new_edge_weight,
+):
+    return (
+        torch.cat([node_x, new_node_x]),
+        torch.cat([edge_index, new_edge_index], dim=1),
+        torch.cat([edge_weight, new_edge_weight]),
+    )
+
+
 class GCNPairModel(nn.Module):
-    def __init__(self, node_x, graph_edges, n_recipes):
+    def __init__(self, input_dim):
         super().__init__()
-        self.n_recipes = n_recipes
-        self.register_buffer("node_x", node_x)
-        self.register_buffer("graph_edges", graph_edges)
-        self.conv1 = GCNConv(node_x.shape[1], HIDDEN)
+        self.conv1 = GCNConv(input_dim, HIDDEN)
         self.conv2 = GCNConv(HIDDEN, EMBEDDING_DIM)
         self.decoder = nn.Sequential(
             nn.Linear(EMBEDDING_DIM * 2, HIDDEN),
@@ -173,14 +191,9 @@ class GCNPairModel(nn.Module):
             nn.Linear(HIDDEN, 1),
         )
 
-    def encode(self, node_x=None, edge_index=None):
-        node_x = self.node_x if node_x is None else node_x
-        edge_index = self.graph_edges if edge_index is None else edge_index
-        hidden = F.relu(self.conv1(node_x, edge_index))
-        return F.normalize(self.conv2(hidden, edge_index), dim=1)
-
-    def forward(self):
-        return self.encode()
+    def forward(self, node_x, edge_index, edge_weight):
+        hidden = F.relu(self.conv1(node_x, edge_index, edge_weight))
+        return F.normalize(self.conv2(hidden, edge_index, edge_weight), dim=1)
 
     def score(self, embeddings, pairs):
         first, second = embeddings[pairs[:, 0]], embeddings[pairs[:, 1]]
@@ -188,28 +201,6 @@ class GCNPairModel(nn.Module):
             [first, second], dim=1
         )
         return self.decoder(features).squeeze(1)
-
-    # TODO this does not use edge weights from file, add them
-    def embed_new(self, recipe_x, ingredient_ids, train_embeddings):
-        recipe_x = recipe_x.to(self.node_x.device)
-        n_existing = self.node_x.shape[0]
-        rows = []
-        cols = []
-        for row, ids in enumerate(ingredient_ids):
-            rows.extend([self.n_recipes + ingredient_id
-                         for ingredient_id in ids])
-            cols.extend([n_existing + row] * len(ids))
-        if rows:
-            new_edges = torch.tensor(
-                [rows, cols], dtype=torch.long, device=recipe_x.device
-            )
-        else:
-            new_edges = torch.empty((2, 0), dtype=torch.long, device=recipe_x.device)
-        x = torch.cat([self.node_x, recipe_x])
-        edges = torch.cat([self.graph_edges, new_edges], dim=1)
-        z = self.encode(x, edges)
-        return z[n_existing:]
-
 
 def pair_loss(model, embeddings, positives, negatives):
     positive_scores = model.score(embeddings, positives)
@@ -220,53 +211,14 @@ def pair_loss(model, embeddings, positives, negatives):
     )
 
 
-# TODO this eval is bad, use our other eval metrics
-@torch.no_grad()
-def evaluate(
-    query_embeddings, candidate_embeddings, query_ids, candidate_ids,
-    recipe_ingredients, recipe_weights, recipe_vectors
-):
-    hits, reciprocal_ranks, ndcgs = [], [], []
-    candidate_ids = np.asarray(candidate_ids)
-    for row, query_id in enumerate(query_ids):
-        similarities = query_embeddings[row] @ candidate_embeddings.T
-        order = np.argsort(-similarities)
-        relevant = np.array([
-            is_positive_similarity(
-                weighted_jaccard(
-                    recipe_ingredients[query_id], recipe_ingredients[candidate_id],
-                    (recipe_weights[query_id], recipe_weights[candidate_id]),
-                ),
-                semantic_similarity(
-                    recipe_vectors[query_id], recipe_vectors[candidate_id]
-                ),
-            )
-            for candidate_id in candidate_ids[order]
-        ])
-        relevant_count = int(relevant.sum())
-        if relevant_count == 0:
-            continue
-        hits.append(float(relevant[:EVALUATION_K].sum() > 0))
-        first = np.flatnonzero(relevant)
-        reciprocal_ranks.append(1.0 / (first[0] + 1))
-        gains = relevant[:EVALUATION_K] / np.log2(np.arange(2, EVALUATION_K + 2))
-        ideal = np.sort(relevant)[::-1][:EVALUATION_K] / np.log2(
-            np.arange(2, EVALUATION_K + 2)
-        )
-        ndcgs.append(float(gains.sum() / max(ideal.sum(), 1e-12)))
-    return {
-        "queries": len(hits),
-        "hits_at_10": float(np.mean(hits)) if hits else None,
-        "mrr": float(np.mean(reciprocal_ranks)) if hits else None,
-        "ndcg_at_10": float(np.mean(ndcgs)) if hits else None,
-    }
-
-
 def train(model_name, steps, seed):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    all_edges, train_edge_index, heldout, recipe_ingredients, recipe_weights, ingredient_x = load_data(device)
+    (
+        all_edges, train_edge_index, train_edge_weights, heldout,
+        recipe_ingredients, recipe_weights, ingredient_x,
+    ) = load_data(device)
     train_ids = np.flatnonzero(~heldout)
     test_ids = np.flatnonzero(heldout)
     n_recipes = len(recipe_ingredients)
@@ -288,16 +240,15 @@ def train(model_name, steps, seed):
     if model_name != "gcn":
         raise ValueError("model must be gcn")
 
-    model = GCNPairModel(
-        torch.cat([recipe_x, ingredient_x]), graph_edges, n_recipes
-    ).to(device)
+    model = GCNPairModel(torch.cat([recipe_x, ingredient_x]).shape[1]).to(device)
+    graph_edge_weights = torch.cat([train_edge_weights, train_edge_weights])
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
     positive_tensor = torch.from_numpy(train_pairs).long().to(device)
     negative_tensor = torch.from_numpy(negatives).long().to(device)
     for step in range(1, steps + 1):
         model.train()
-        embeddings = model()
+        embeddings = model(torch.cat([recipe_x, ingredient_x]), graph_edges, graph_edge_weights)
 
         loss = pair_loss(model, embeddings, positive_tensor, negative_tensor)
         optimizer.zero_grad()
@@ -308,22 +259,38 @@ def train(model_name, steps, seed):
 
     model.eval()
     with torch.no_grad():
-        train_embeddings = model().cpu().numpy()
+        train_node_x = torch.cat([recipe_x, ingredient_x])
+        train_embeddings = model(
+            train_node_x, graph_edges, graph_edge_weights
+        ).cpu().numpy()
+
         heldout_features = recipe_x[test_ids]
         heldout_lists = [recipe_ingredients[recipe_id] for recipe_id in test_ids]
         heldout_weights = [recipe_weights[recipe_id] for recipe_id in test_ids]
-        test_embeddings = model.embed_new(
-            heldout_features, heldout_lists, train_embeddings
-        ).cpu().numpy()
-    metrics = evaluate(
-        test_embeddings,
-        train_embeddings[train_ids],
-        test_ids,
-        train_ids,
-        recipe_ingredients,
-        recipe_weights,
-        recipe_vectors,
-    )
+        rows, cols, weights = [], [], []
+
+        for row, ids in enumerate(heldout_lists):
+            rows.extend(n_recipes + ingredient_id for ingredient_id in ids)
+            cols.extend(len(train_node_x) + row for _ in ids)
+            weights.extend(heldout_weights[row][ingredient_id] for ingredient_id in ids)
+
+        new_edges = torch.tensor([rows, cols], dtype=torch.long, device=device)
+        new_edge_weights = torch.tensor(weights, dtype=torch.float32, device=device)
+        heldout_edges = torch.cat([new_edges, new_edges.flip(0)], dim=1)
+        heldout_edge_weights = torch.cat([new_edge_weights, new_edge_weights])
+
+        all_node_x, all_graph_edges, all_edge_weights = merge_graphs(
+            train_node_x,
+            graph_edges,
+            graph_edge_weights,
+            heldout_features,
+            heldout_edges,
+            heldout_edge_weights,
+        )
+        test_embeddings = model(
+            all_node_x, all_graph_edges, all_edge_weights
+        )[len(train_node_x):len(train_node_x) + len(heldout_features)].cpu().numpy()
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     embedding_recipe_ids = np.concatenate([train_ids, test_ids])
     embedding_values = np.concatenate(
@@ -338,6 +305,7 @@ def train(model_name, steps, seed):
             heldout[embedding_recipe_ids[embedding_order]], "test", "train"
         ),
     )
+    
     config = {
         "model": model_name,
         "seed": seed,
@@ -348,14 +316,13 @@ def train(model_name, steps, seed):
         "semantic_positive_cosine": SEMANTIC_POSITIVE,
         "semantic_negative_cosine": SEMANTIC_NEGATIVE,
         "heldout_queries": len(test_ids),
-        "metrics": metrics,
     }
+
     torch.save({"state_dict": model.state_dict(), "config": config},
                OUTPUT_DIR / f"{model_name}_inductive_s{seed}.pt")
     (OUTPUT_DIR / f"{model_name}_inductive_s{seed}.json").write_text(
         json.dumps(config, indent=2)
     )
-    print(f"inductive test: {metrics}")
 
 
 def main():

@@ -7,12 +7,44 @@ import random
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import torch
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.model_selection import train_test_split
 
 from eval_common import calculate_edge_weights
+from train_recipe_similarity import GCNPairModel, bidirectional_edges
+
+
+def load_model(path="data/similarity/gcn_inductive_s0.pt"):
+    return torch.load(path, map_location="cpu", weights_only=True)
+
+
+def substitution_embeddings(
+    graph,
+    recipe_features,
+    ingredient_features,
+    model_path="data/similarity/gcn_inductive_s0.pt",
+):
+    """Run the trained GCN on a graph with substituted ingredients."""
+    node_x = torch.from_numpy(
+        np.concatenate([recipe_features, ingredient_features])
+    ).float()
+    edge_index = bidirectional_edges(
+        torch.from_numpy(graph["edges"]).long(),
+        recipe_features.shape[0],
+    )
+    edge_weight = torch.from_numpy(
+        np.tile(graph["edge_weights"], 2)
+    ).float()
+
+    model = GCNPairModel(node_x.shape[1])
+    model.load_state_dict(load_model(model_path)["state_dict"])
+    model.eval()
+    with torch.no_grad():
+        embeddings = model(node_x, edge_index, edge_weight)
+    return embeddings[:len(recipe_features)].numpy()
 
 
 def get_random_ingredients(
@@ -21,18 +53,6 @@ def get_random_ingredients(
     """Return up to ``k`` random ingredient names above a usage threshold."""
     if ingredients is None:
         ingredients = pd.read_csv("data/processed/ingredients.csv")
-    if not isinstance(ingredients, pd.DataFrame):
-        raise TypeError("ingredients must be a pandas DataFrame.")
-    if "name" not in ingredients or "recipe_count" not in ingredients:
-        raise ValueError(
-            "ingredients must contain 'name' and 'recipe_count' columns."
-        )
-    if not isinstance(k, (int, np.integer)):
-        raise TypeError("k must be an integer.")
-    if k < 0:
-        raise ValueError("k must be non-negative.")
-    if not isinstance(used_more_than, (int, float, np.integer, np.floating)):
-        raise TypeError("used_more_than must be numeric.")
 
     candidates = ingredients.loc[
         ingredients["recipe_count"] > used_more_than, "name"
@@ -288,11 +308,11 @@ def build_substitution_graph(
 
 '''
 TODO 
-    - make a method to load a model, run it on the new graph with substitution
-    - report AUC scores of the new embeddings, only on the nodes with substitutions
+    - report AUC scores of the substitution embeddings, only on the nodes with substitutions
     - measure the distance of embeddings with a substitution and embeddings without
         Make a graph with completely random substitutions and see if the distances are 
         greater there
+    - This should be done for our baselines as well, maybe we can skip node2vec for now
 '''
 if __name__ == "__main__":
     edges = np.load("data/processed/edges.npz")
@@ -301,15 +321,28 @@ if __name__ == "__main__":
     ingr = pd.read_csv("data/processed/ingredients.csv")
     node2vec = np.load("data/node2vec/embeddings.npz")
 
-    lightgcn_emb = np.load("data/similarity/lightgcn_inductive_s0_embeddings.npz")
+    lightgcn_emb = np.load("data/similarity/gcn_inductive_s0_embeddings.npz")
     recipe_sentence_embeddings = np.load("data/processed/recipe_x_full.npy")
+    ingredient_x = np.load("data/processed/ingredient_x.npy")
+    pairs = load_pairs(ingr)
+    substitution_graph, _ = build_substitution_graph(
+        pairs,
+        edges["all"],
+        num_ingredients=len(ingr),
+        seed=0,
+    )
+    substitution_emb = substitution_embeddings(
+        substitution_graph,
+        np.load("data/processed/recipe_x_full_weighted.npy"),
+        ingredient_x,
+    )
 
     plot_ingredient_auc(
         get_random_ingredients(100, ingr, used_more_than=10),
         embeddings_by_name={
             "Node2Vec": node2vec["recipe_embeddings"],
             "Sentence encoder": recipe_sentence_embeddings,
-            "LightGCN": lightgcn_emb['embeddings']
+            "GCN": lightgcn_emb['embeddings'],
+            "GCN (substitution)": substitution_emb,
         }
     )
-
