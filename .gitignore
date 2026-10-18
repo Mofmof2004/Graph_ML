@@ -9,3 +9,6 @@ lib
 lib64
 
 pyenv.cfg
+pyvenv.cfg
+
+evaluation_outputs
