@@ -271,11 +271,9 @@ for name, e in splits.items():
 
 #----------Edge Weights----------#
 
-# edge_weight, idf = calculate_edge_weights(
-#     edge_index, edge_share, idf_graph=splits["train"]
-# )
 edge_weight, idf = calculate_edge_weights(
-    edge_index, len(ingredient_names), idf_graph=splits["train"]
+    edge_index, len(ingredient_names), edge_share=edge_share,
+    idf_graph=splits["train"], share_exponent=SHARE_EXPONENT,
 )
 weight_splits = {"train": edge_weight[train_idx], "val": edge_weight[val_idx],
                  "test": edge_weight[test_idx], "heldout": edge_weight[heldout_idx]}

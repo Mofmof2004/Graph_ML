@@ -8,13 +8,14 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import torch
+import torch.nn.functional as F
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.model_selection import train_test_split
 
 from eval_common import calculate_edge_weights
-from train_recipe_similarity import GCNPairModel, bidirectional_edges
+from train_recipe_similarity import MODELS, bidirectional_edges
 
 
 def load_model(path="data/similarity/gcn_inductive_s0.pt"):
@@ -27,7 +28,7 @@ def substitution_embeddings(
     ingredient_features,
     model_path="data/similarity/gcn_inductive_s0.pt",
 ):
-    """Run the trained GCN on a graph with substituted ingredients."""
+    """Run a trained graph encoder on a graph with substituted ingredients."""
     node_x = torch.from_numpy(
         np.concatenate([recipe_features, ingredient_features])
     ).float()
@@ -39,11 +40,12 @@ def substitution_embeddings(
         np.tile(graph["edge_weights"], 2)
     ).float()
 
-    model = GCNPairModel(node_x.shape[1])
-    model.load_state_dict(load_model(model_path)["state_dict"])
+    checkpoint = load_model(model_path)
+    model = MODELS[checkpoint["config"]["model"]](node_x.shape[1])
+    model.load_state_dict(checkpoint["state_dict"])
     model.eval()
     with torch.no_grad():
-        embeddings = model(node_x, edge_index, edge_weight)
+        embeddings = F.normalize(model(node_x, edge_index, edge_weight), dim=1)
     return embeddings[:len(recipe_features)].numpy()
 
 

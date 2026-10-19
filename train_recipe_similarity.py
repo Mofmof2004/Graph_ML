@@ -1,9 +1,11 @@
-"""Train inductive recipe-similarity models.
+"""Train inductive recipe/ingredient embeddings with an unsupervised random-walk loss.
 
-Similarity is defined by ingredient overlap, not recipe titles. Models train on
-non-held-out recipes and embed held-out recipes from their available ingredient
-lists at inference time. Evaluation retrieves similar training recipes for each
-held-out query.
+The objective is the one from GraphSAGE (Hamilton et al., 2017): nodes that
+co-occur on short random walks should have similar embeddings, and nodes drawn
+from a degree-based noise distribution should not. Walks follow edges with
+probability proportional to the IDF * quantity-share edge weights. Models train
+on the non-held-out graph and embed held-out recipes from their ingredient
+lists at inference time.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
+from torch_geometric.utils import scatter
 
 
 DATA_DIR = Path("data/processed")
@@ -25,15 +28,12 @@ OUTPUT_DIR = Path("data/similarity")
 SEED = 0
 HIDDEN = 128
 EMBEDDING_DIM = 128
-LAYERS = 2
 DEFAULT_STEPS = 1000
 EVAL_EVERY = 50
-POSITIVE_JACCARD = 0.30
-NEGATIVE_JACCARD = 0.05
-SEMANTIC_POSITIVE = 0.88
-SEMANTIC_NEGATIVE = 0.80
-PARTIAL_OVERLAP = 0.15
-EVALUATION_K = 10
+BATCH_NODES = 512        
+WALK_LENGTH = 5          
+NEGATIVES = 20           
+NEGATIVE_POWER = 0.75    
 
 
 def load_data(device):
@@ -63,84 +63,59 @@ def load_data(device):
     )
 
 
-def weighted_jaccard(first, second, weights):
-    """Weighted Jaccard; rare, high-weight ingredients contribute more."""
-    ingredients = first | second
-    numerator = sum(min(weights[0].get(i, 0.0), weights[1].get(i, 0.0)) for i in ingredients)
-    denominator = sum(max(weights[0].get(i, 0.0), weights[1].get(i, 0.0)) for i in ingredients)
-    return numerator / denominator if denominator else 0.0
+class WeightedWalker:
+    """Weighted random walks: the next node is drawn with probability proportional
+    to the edge weight. Nodes without edges stay where they are."""
+
+    def __init__(self, edge_index, edge_weight, n_nodes):
+        order = torch.argsort(edge_index[0], stable=True)
+        
+        self.targets = edge_index[1, order]
+        
+        self.degree = torch.bincount(edge_index[0], minlength=n_nodes)
+        self.row_start = torch.cat([self.degree.new_zeros(1), self.degree.cumsum(0)])
+        self.cumulative = torch.cat([
+            edge_weight.new_zeros(1, dtype=torch.float64),
+            edge_weight[order].double().cumsum(0),
+        
+        ])
+
+    def walk(self, start, length, generator=None):
+        steps = [start]
+        current = start
+        for _ in range(length):
+            first, last = self.row_start[current], self.row_start[current + 1]
+            low, high = self.cumulative[first], self.cumulative[last]
+            draw = low + torch.rand(len(current), dtype=torch.float64,
+                                    device=current.device, generator=generator) * (high - low)
+            position = torch.searchsorted(self.cumulative, draw, right=True) - 1
+            position = torch.minimum(torch.maximum(position, first), last - 1)
+            has_edges = last > first
+            current = torch.where(has_edges, self.targets[position.clamp(min=0)], current)
+            steps.append(current)
+        return torch.stack(steps, dim=1)
 
 
-def semantic_similarity(first, second):
-    """Cosine similarity of weighted ingredient text representations."""
-    first_norm = np.linalg.norm(first)
-    second_norm = np.linalg.norm(second)
-    if first_norm == 0.0 or second_norm == 0.0:
-        return 0.0
-    return float(np.dot(first, second) / (first_norm * second_norm))
+def sample_walk_pairs(walker, start_nodes, negative_distribution, generator=None):
+    """Positive (anchor, context) pairs from walks and NEGATIVES noise nodes per pair."""
+    start = start_nodes[torch.randint(len(start_nodes), (BATCH_NODES,),
+                                      device=start_nodes.device, generator=generator)]
+    walks = walker.walk(start, WALK_LENGTH, generator)
+    anchors = walks[:, :1].expand(-1, WALK_LENGTH).reshape(-1)
+    contexts = walks[:, 1:].reshape(-1)
+    keep = anchors != contexts
+    anchors, contexts = anchors[keep], contexts[keep]
+    negatives = torch.multinomial(negative_distribution, len(anchors) * NEGATIVES,
+                                  replacement=True, generator=generator)
+    return anchors, contexts, negatives.view(len(anchors), NEGATIVES)
 
 
-def is_positive_similarity(overlap, semantic):
-    """Require overlap, while allowing strong semantic agreement to refine it."""
-    return overlap >= POSITIVE_JACCARD or (
-        overlap >= PARTIAL_OVERLAP and semantic >= SEMANTIC_POSITIVE
-    )
-
-
-def is_negative_similarity(overlap, semantic):
-    """Keep semantically related recipes out of the negative training labels."""
-    return overlap <= NEGATIVE_JACCARD and semantic <= SEMANTIC_NEGATIVE
-
-
-def build_training_pairs(
-    recipe_ids, recipe_ingredients, recipe_weights, recipe_vectors, seed
-):
-    rng = np.random.default_rng(seed)
-    positives, negatives = [], []
-    by_ingredient = {}
-    for recipe_id in recipe_ids:
-        for ingredient in recipe_ingredients[recipe_id]:
-            by_ingredient.setdefault(ingredient, []).append(recipe_id)
-
-    positive_candidates = set()
-    for ids in by_ingredient.values():
-        ids = np.asarray(ids)
-        for _ in range(min(len(ids) * 3, 100)):
-            if len(ids) < 2:
-                break
-            first, second = rng.choice(ids, 2, replace=False)
-            similarity = weighted_jaccard(
-                recipe_ingredients[first], recipe_ingredients[second],
-                (recipe_weights[first], recipe_weights[second]),
-            )
-            semantic = semantic_similarity(recipe_vectors[first], recipe_vectors[second])
-            if is_positive_similarity(similarity, semantic):
-                positive_candidates.add((min(first, second), max(first, second)))
-    positives = list(positive_candidates)
-
-    recipe_ids = np.asarray(recipe_ids)
-    seen = set(positives)
-    target = max(len(positives), 1)
-    attempts = 0
-    max_attempts = max(target * 100, 10_000)
-    while len(negatives) < target and attempts < max_attempts:
-        attempts += 1
-        first, second = rng.choice(recipe_ids, 2, replace=False)
-        pair = (min(first, second), max(first, second))
-        similarity = weighted_jaccard(
-            recipe_ingredients[first], recipe_ingredients[second],
-            (recipe_weights[first], recipe_weights[second]),
-        )
-        semantic = semantic_similarity(recipe_vectors[first], recipe_vectors[second])
-        if pair not in seen and is_negative_similarity(similarity, semantic):
-            negatives.append(pair)
-            seen.add(pair)
-    if len(negatives) < target:
-        raise RuntimeError(
-            f"Could only find {len(negatives)} of {target} negative pairs after "
-            f"{max_attempts} attempts; adjust the similarity thresholds."
-        )
-    return np.asarray(positives, dtype=np.int64), np.asarray(negatives, dtype=np.int64)
+def random_walk_loss(embeddings, anchors, contexts, negatives):
+    anchor = embeddings[anchors]
+    positive_scores = (anchor * embeddings[contexts]).sum(-1)
+    negative_scores = (anchor.unsqueeze(1) * embeddings[negatives]).sum(-1)
+    return -(F.logsigmoid(positive_scores).mean()
+             + F.logsigmoid(-negative_scores).mean())
 
 
 def recipe_features(edge_index, ingredient_x, n_recipes, edge_weights=None):
@@ -179,41 +154,56 @@ def merge_graphs(
     )
 
 
-class GCNPairModel(nn.Module):
+class WeightedSAGEConv(nn.Module):
+    """GraphSAGE layer with a mean aggregator that weights neighbours by edge weight."""
+
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.self_linear = nn.Linear(input_dim, output_dim)
+        self.neighbour_linear = nn.Linear(input_dim, output_dim, bias=False)
+
+    def forward(self, x, edge_index, edge_weight):
+        source, target = edge_index
+        total = scatter(x[source] * edge_weight.unsqueeze(1), target, 0,
+                        dim_size=len(x), reduce="sum")
+        weight = scatter(edge_weight, target, 0, dim_size=len(x), reduce="sum")
+        neighbours = total / weight.clamp(min=1e-12).unsqueeze(1)
+        return self.self_linear(x) + self.neighbour_linear(neighbours)
+
+
+class GCNModel(nn.Module):
+    """Two GCN layers."""
+
     def __init__(self, input_dim):
         super().__init__()
         self.conv1 = GCNConv(input_dim, HIDDEN)
         self.conv2 = GCNConv(HIDDEN, EMBEDDING_DIM)
-        self.decoder = nn.Sequential(
-            nn.Linear(EMBEDDING_DIM * 2, HIDDEN),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(HIDDEN, 1),
-        )
 
     def forward(self, node_x, edge_index, edge_weight):
+        """Raw embeddings, used by the loss. Normalise them for retrieval."""
         hidden = F.relu(self.conv1(node_x, edge_index, edge_weight))
-        return F.normalize(self.conv2(hidden, edge_index, edge_weight), dim=1)
+        return self.conv2(hidden, edge_index, edge_weight)
 
-    def score(self, embeddings, pairs):
-        first, second = embeddings[pairs[:, 0]], embeddings[pairs[:, 1]]
-        features = torch.cat(
-            [first, second], dim=1
-        )
-        return self.decoder(features).squeeze(1)
 
-def pair_loss(model, embeddings, positives, negatives):
-    positive_scores = model.score(embeddings, positives)
-    negative_scores = model.score(embeddings, negatives)
-    return F.binary_cross_entropy_with_logits(
-        torch.cat([positive_scores, negative_scores]),
-        torch.cat([torch.ones_like(positive_scores), torch.zeros_like(negative_scores)]),
-    )
+class GraphSAGEModel(nn.Module):
+    """Two GraphSAGE layers with edge-weighted mean aggregation."""
+
+    def __init__(self, input_dim):
+        super().__init__()
+        self.conv1 = WeightedSAGEConv(input_dim, HIDDEN)
+        self.conv2 = WeightedSAGEConv(HIDDEN, EMBEDDING_DIM)
+
+    def forward(self, node_x, edge_index, edge_weight):
+        """Raw embeddings, used by the loss. Normalise them for retrieval."""
+        hidden = F.relu(self.conv1(node_x, edge_index, edge_weight))
+        return self.conv2(hidden, edge_index, edge_weight)
+
+
+MODELS = {"gcn": GCNModel, "graphsage": GraphSAGEModel}
 
 
 def train(model_name, steps, seed):
     torch.manual_seed(seed)
-    rng = np.random.default_rng(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     (
         all_edges, train_edge_index, train_edge_weights, heldout,
@@ -226,31 +216,24 @@ def train(model_name, steps, seed):
     recipe_x = torch.from_numpy(
         np.load(DATA_DIR / "recipe_x_train_weighted.npy")
     ).float().to(device)
-    recipe_vectors = np.load(DATA_DIR / "recipe_x_full_weighted.npy")
     graph_edges = bidirectional_edges(train_edge_index, n_recipes)
-
-    #TODO
-    #This just samples training pairs before the training and uses them. Not sure if best approach
-    train_pairs, negatives = build_training_pairs(
-        train_ids, recipe_ingredients, recipe_weights, recipe_vectors, seed
-    )
-    if len(train_pairs) == 0:
-        raise RuntimeError("No positive ingredient-similarity pairs were found.")
-
-    if model_name != "gcn":
-        raise ValueError("model must be gcn")
-
-    model = GCNPairModel(torch.cat([recipe_x, ingredient_x]).shape[1]).to(device)
     graph_edge_weights = torch.cat([train_edge_weights, train_edge_weights])
+    node_x = torch.cat([recipe_x, ingredient_x])
 
+    walker = WeightedWalker(graph_edges, graph_edge_weights, len(node_x))
+    start_nodes = torch.nonzero(walker.degree > 0).squeeze(1)
+    negative_distribution = walker.degree.float() ** NEGATIVE_POWER
+    generator = torch.Generator(device=device).manual_seed(seed)
+
+    model = MODELS[model_name](node_x.shape[1]).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
-    positive_tensor = torch.from_numpy(train_pairs).long().to(device)
-    negative_tensor = torch.from_numpy(negatives).long().to(device)
     for step in range(1, steps + 1):
         model.train()
-        embeddings = model(torch.cat([recipe_x, ingredient_x]), graph_edges, graph_edge_weights)
-
-        loss = pair_loss(model, embeddings, positive_tensor, negative_tensor)
+        anchors, contexts, negatives = sample_walk_pairs(
+            walker, start_nodes, negative_distribution, generator
+        )
+        embeddings = model(node_x, graph_edges, graph_edge_weights)
+        loss = random_walk_loss(embeddings, anchors, contexts, negatives)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -259,9 +242,9 @@ def train(model_name, steps, seed):
 
     model.eval()
     with torch.no_grad():
-        train_node_x = torch.cat([recipe_x, ingredient_x])
-        train_embeddings = model(
-            train_node_x, graph_edges, graph_edge_weights
+        train_node_x = node_x
+        train_embeddings = F.normalize(
+            model(train_node_x, graph_edges, graph_edge_weights), dim=1
         ).cpu().numpy()
 
         heldout_features = recipe_x[test_ids]
@@ -287,9 +270,9 @@ def train(model_name, steps, seed):
             heldout_edges,
             heldout_edge_weights,
         )
-        test_embeddings = model(
+        test_embeddings = F.normalize(model(
             all_node_x, all_graph_edges, all_edge_weights
-        )[len(train_node_x):len(train_node_x) + len(heldout_features)].cpu().numpy()
+        ), dim=1)[len(train_node_x):len(train_node_x) + len(heldout_features)].cpu().numpy()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     embedding_recipe_ids = np.concatenate([train_ids, test_ids])
@@ -310,11 +293,11 @@ def train(model_name, steps, seed):
         "model": model_name,
         "seed": seed,
         "steps": steps,
-        "positive_weighted_jaccard": POSITIVE_JACCARD,
-        "negative_weighted_jaccard": NEGATIVE_JACCARD,
-        "partial_overlap_for_semantic_positive": PARTIAL_OVERLAP,
-        "semantic_positive_cosine": SEMANTIC_POSITIVE,
-        "semantic_negative_cosine": SEMANTIC_NEGATIVE,
+        "loss": "graphsage random walk",
+        "batch_nodes": BATCH_NODES,
+        "walk_length": WALK_LENGTH,
+        "negatives": NEGATIVES,
+        "negative_power": NEGATIVE_POWER,
         "heldout_queries": len(test_ids),
     }
 
@@ -327,7 +310,7 @@ def train(model_name, steps, seed):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("model", choices=["gcn"], default="gcn", nargs="?")
+    parser.add_argument("model", choices=list(MODELS), default="gcn", nargs="?")
     parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
     parser.add_argument("--seed", type=int, default=SEED)
     args = parser.parse_args()
