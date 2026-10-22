@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from normalisation import normalise
-from sentence_transformers import SentenceTransformer
+from graph_features import encode_words
 
 DATA_DIR = "data/processed"
 SUBSTITUTIONS = "data/eval/substitutions_all.csv"   # from prepare_substitutions.py
@@ -104,11 +104,6 @@ def calculate_edge_weights(graph, num_ingredients, edge_share=1, idf_graph=None,
     idf = np.log((1 + n_recipes) / (1 + ingredient_df)) + 1.0
     weights = (idf[graph[1]] * edge_share ** share_exponent).astype(np.float32)
     return weights, idf
-
-def encode_words(words):
-    model = SentenceTransformer(FEATURE_MODEL)   # downloads the model on first run
-    return model.encode(words, batch_size=256,
-                        normalize_embeddings=True, show_progress_bar=True).astype(np.float32)
 
 #----------Same-dish retrieval----------#
 

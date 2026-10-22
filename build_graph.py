@@ -9,7 +9,7 @@ import pandas as pd
 from normalisation import normalise, norm_title
 from quantities import Properties, recipe_grams
 
-from eval_common import encode_words, calculate_edge_weights
+from graph_features import FEATURE_MODEL, encode_words, calculate_edge_weights
 
 RAW = "data/raw/RecipeNLG_dataset.csv"
 OUT = "data/interim"
