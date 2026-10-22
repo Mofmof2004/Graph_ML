@@ -2,9 +2,11 @@
 
     python run_experiments.py                       # all evaluations, GNN seeds 0 1 2
     python run_experiments.py --only substitution   # a subset
+    python run_experiments.py --only substitution_benchmark  # frozen baseline comparison, no training
     python run_experiments.py --retrain             # retrain the GNN checkpoints first
 
-Missing GNN checkpoints (and the Node2Vec embeddings) are trained before evaluating.
+Missing GNN checkpoints (and the Node2Vec embeddings) are trained for the original evaluations.
+The optional substitution_benchmark runs baselines without training checkpoints.
 
 Output, under results/<timestamp>/ by default:
     config.json         arguments, git commit, method list
@@ -63,7 +65,7 @@ def metric_rows(evaluation, metric, values):
 
 
 def bar_plot(ax, table, title, reference=None):
-    ax.barh(table.index, table["mean"], xerr=table["std"], color="tab:blue")
+    ax.barh(table.index, table["mean"], xerr=table["std"].fillna(0.0), color="tab:blue")
     for row, value in enumerate(table["mean"]):
         ax.text(value, row, f" {value:.3f}", va="center", fontsize=8)
     if reference is not None:
@@ -216,6 +218,20 @@ def substitution(data, methods, embeddings, out):
     fig.tight_layout(); fig.savefig(out / "win_rate_by_name_similarity.png", dpi=130); plt.close(fig)
     return metrics
 
+
+def substitution_benchmark(out):
+    """Run the frozen validation comparison of substitution baselines."""
+    import evaluate_substitutions as benchmark
+
+    report = benchmark.evaluate(benchmark.parse_args(["--output-dir", str(out)]))
+    return [{"evaluation": "substitution_benchmark", "metric": f"{metric}_{stratum}",
+             "method": run["method"], "seed": run["seed"], "value": metrics[metric]}
+            for run in report["runs"]
+            for stratum, metrics in run["metrics"].items()
+            for metric in ["micro_accuracy", "macro_accuracy", "mean_margin"]
+            if metrics[metric] is not None]
+
+
 def retrieval_ranks(z, queries, candidates, titles):
     """Rank of the first other recipe with the same title among the candidates, per query."""
     z = unit(z.astype(np.float32))
@@ -291,7 +307,8 @@ def duplicates(data, methods, embeddings, out):
 
 
 EVALUATIONS = {"separability": separability, "substitution": substitution,
-               "same_dish": same_dish, "duplicates": duplicates}
+               "same_dish": same_dish, "duplicates": duplicates,
+               "substitution_benchmark": substitution_benchmark}
 
 
 def ensure_trained(seeds, steps, retrain):
@@ -311,6 +328,8 @@ def summary_plot(summary, out):
               ("separability", "auc_unseen", "Separability AUC, unseen recipes", None),
               ("substitution", "win_rate_all", "Substitution win rate", 0.5),
               ("substitution", "win_rate_dissimilar_names", "Substitution win rate, dissimilar names", 0.5),
+              ("substitution_benchmark", "macro_accuracy_all", "Substitution pair macro accuracy", 0.5),
+              ("substitution_benchmark", "macro_accuracy_lower_text_similarity", "Substitution, lower name similarity", 0.5),
               ("same_dish", "mrr_known", "Same-dish MRR, known recipes", None),
               ("same_dish", "mrr_unseen", "Same-dish MRR, unseen recipes", None)]
     panels = [p for p in panels if ((summary.evaluation == p[0]) & (summary.metric == p[1])).any()]
@@ -329,38 +348,44 @@ def summary_plot(summary, out):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, default=Path("results") / time.strftime("%Y%m%d_%H%M%S"))
-    parser.add_argument("--only", nargs="+", choices=list(EVALUATIONS), default=list(EVALUATIONS))
+    parser.add_argument("--only", nargs="+", choices=list(EVALUATIONS),
+                        default=[name for name in EVALUATIONS if name != "substitution_benchmark"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     parser.add_argument("--steps", type=int, default=1000, help="training steps for missing checkpoints")
     parser.add_argument("--retrain", action="store_true")
     args = parser.parse_args()
 
-    ensure_trained(args.seeds, args.steps, args.retrain)
-    data = load_data()
-    methods = build_methods(data, args.seeds)
+    data, methods, embeddings = None, [], {}
+    if any(name != "substitution_benchmark" for name in args.only):
+        ensure_trained(args.seeds, args.steps, args.retrain)
+        data = load_data()
+        methods = build_methods(data, args.seeds)
+        embeddings = {m: m.recipes() for m in methods}
     print("methods:", ", ".join(f"{m.name}{'' if getattr(m, 'seed', None) is None else f' s{m.seed}'}"
                                 for m in methods))
-    embeddings = {m: m.recipes() for m in methods}
 
     args.out.mkdir(parents=True, exist_ok=True)
     commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-    (args.out / "config.json").write_text(json.dumps({
-        "evaluations": args.only, "seeds": args.seeds, "git_commit": commit,
-        "methods": [m.name for m in first_seed(methods)],
-        "probe_ingredients": PROBE_INGREDIENTS, "substitution_cases": SUBSTITUTION_CASES,
-    }, indent=2))
 
     metrics = []
     for name in args.only:
         print(f"\n== {name}")
         folder = args.out / name
         folder.mkdir(exist_ok=True)
-        metrics += EVALUATIONS[name](data, methods, embeddings, folder)
+        if name == "substitution_benchmark":
+            metrics += substitution_benchmark(folder)
+        else:
+            metrics += EVALUATIONS[name](data, methods, embeddings, folder)
 
     metrics = pd.DataFrame(metrics)
+    (args.out / "config.json").write_text(json.dumps({
+        "evaluations": args.only, "seeds": args.seeds, "git_commit": commit,
+        "methods": metrics["method"].drop_duplicates().tolist(),
+        "probe_ingredients": PROBE_INGREDIENTS, "substitution_cases": SUBSTITUTION_CASES,
+    }, indent=2))
     metrics.to_csv(args.out / "metrics.csv", index=False)
     summary = (metrics.groupby(["evaluation", "metric", "method"], sort=False)["value"]
-               .agg(["mean", "std", "count"]).fillna({"std": 0.0}).reset_index())
+               .agg(["mean", "std", "count"]).reset_index())
     summary.to_csv(args.out / "summary.csv", index=False)
     summary_plot(summary, args.out)
     with pd.option_context("display.width", 140, "display.max_rows", 200):

@@ -165,3 +165,51 @@ The manually maintained metadata files are stored in `data/`:
 data/ingredient_properties.csv
 data/substitutions.csv
 ```
+
+## Frozen substitution baseline comparison
+
+This optional evaluation compares plausible ingredient substitutions with random
+replacements of similar training frequency. Both copies preserve the replaced
+ingredient's mass share and use identical frozen cases across methods.
+
+```powershell
+python evaluate_substitutions.py --output-dir results/substitution_validation
+```
+
+The defaults compare binary Jaccard, the mean of ingredient text embeddings,
+the IDF/quantity-weighted mean, and weighted ingredient multi-hot vectors.
+They reuse processed data without training or downloads. Add
+`--methods jaccard mean weighted_mean weighted_multihot sbert` to also encode
+whole ingredient lists with the configured sentence transformer; this may download
+the encoder. Recipe titles are excluded from that baseline.
+
+The new benchmark is also available in the experiment runner:
+
+```powershell
+python run_experiments.py --only substitution_benchmark --out results/substitution_validation_runner
+```
+
+The original runner functions and default evaluation selection are preserved.
+The standalone script exposes protocol options and avoids importing the model stack.
+Learned-model checkpoint integration is deferred from this initial evaluation change.
+
+Reserved recipes are excluded from training edges, then deterministically divided
+into validation and test populations. Develop on the default validation partition;
+use `--split test` only after fixing the comparison. The script prefers prepared
+`data/eval/substitutions_all.csv` when available, otherwise the manual
+`data/substitutions.csv`; `--substitutions` selects an explicit CSV.
+
+Outputs include `cases.json`, `scores.csv`, `summary.csv`, `summary.json`,
+`comparison.md`, and (with matplotlib installed) `comparison.png`. Cases are
+fingerprinted against the data, substitution labels, and protocol; incompatible
+reuse is rejected. Summaries include case accuracy, substitution-pair macro
+accuracy, pair-bootstrap confidence intervals, text-similarity strata, and paired
+differences against the weighted mean. Single-run seed variability is unavailable.
+Jaccard should tie at 0.5 because each variant changes exactly one ingredient.
+These labels do not guarantee that a substitute works in every recipe context.
+
+Run the local protocol and baseline checks with:
+
+```powershell
+python -m unittest discover -s tests -v
+```
