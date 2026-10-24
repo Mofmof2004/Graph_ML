@@ -166,7 +166,7 @@ data/ingredient_properties.csv
 data/substitutions.csv
 ```
 
-## Frozen substitution baseline comparison
+## Frozen substitution comparison
 
 This optional evaluation compares plausible ingredient substitutions with random
 replacements of similar training frequency. Both copies preserve the replaced
@@ -190,8 +190,9 @@ python run_experiments.py --only substitution_benchmark --out results/substituti
 ```
 
 The original runner functions and default evaluation selection are preserved.
-The standalone script exposes protocol options and avoids importing the model stack.
-Learned-model checkpoint integration is deferred from this initial evaluation change.
+The standalone script exposes protocol options. Baseline-only runs avoid importing
+the model stack. Add `--checkpoints` to compare trained two-layer GCN/GraphSAGE models;
+the evaluation never trains models.
 
 Reserved recipes are excluded from training edges, then deterministically divided
 into validation and test populations. Develop on the default validation partition;
@@ -213,3 +214,46 @@ Run the local protocol and baseline checks with:
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+
+### Compare the existing two-layer GCN and GraphSAGE
+
+Train checkpoints from the same processed dataset and training settings. For a
+short integration check, use `--steps 10` and a separate output directory.
+For a controlled pilot with seeds 0, 1 and 2:
+
+```powershell
+foreach ($evalSeed in 0, 1, 2) {
+    python train_recipe_similarity.py gcn --steps 100 --seed $evalSeed --device cpu --threads 2 --output-dir data/similarity/substitution_two_layer
+    python train_recipe_similarity.py graphsage --steps 100 --seed $evalSeed --device cpu --threads 2 --output-dir data/similarity/substitution_two_layer
+}
+$evalCheckpoints = @(Get-ChildItem data/similarity/substitution_two_layer/*_inductive_s*.pt | ForEach-Object { $_.FullName })
+python evaluate_substitutions.py --checkpoints $evalCheckpoints --output-dir results/substitution_two_layer
+```
+
+These are pilot budgets, not a claim of convergence. Select the final training
+budget on validation data. The existing two-layer architectures and random-walk
+loss are unchanged; no substitution labels are used in training.
+Training and evaluation derive recipe inputs from training edges, without requiring
+`recipe_x_train_weighted.npy`. Unseen recipe variants receive messages from the
+fixed ingredient graph and cannot send messages back to it.
+
+Checkpoints record the data fingerprints, dimensions, feature scheme, inference
+policy and training settings. Incompatible or older checkpoints without that
+metadata are rejected; retrain them with this version. Different settings for the
+same model must be evaluated in separate runs rather than averaged as seeds.
+Reports retain each checkpoint's scores/configuration, aggregate repeated seeds,
+and compare the seed-averaged per-case wins with the weighted-mean baseline.
+Pair-bootstrap intervals describe substitution-pair variability conditional on
+those seeds; seed variability is reported separately.
+
+The same checkpoints can be passed to the experiment runner without training:
+
+```powershell
+python run_experiments.py --only substitution_benchmark --checkpoints $evalCheckpoints --out results/substitution_two_layer_runner
+```
+
+Use the standalone evaluator's `--cases` option to reuse a compatible frozen
+manifest, `--data-dir` for a different processed dataset, `--batch-size` for query
+batching, and `--device`/`--threads` for inference resources. Node2Vec remains
+outside this substitution comparison because it cannot directly embed new variants.

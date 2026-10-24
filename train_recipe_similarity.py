@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +22,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
 from torch_geometric.utils import scatter
+
+from graph_features import (FEATURE_SCHEME, INFERENCE_POLICY, data_fingerprints,
+                            pooled_recipe_features)
 
 
 DATA_DIR = Path("data/processed")
@@ -36,14 +40,15 @@ NEGATIVES = 20
 NEGATIVE_POWER = 0.75    
 
 
-def load_data(device):
-    edges = np.load(DATA_DIR / "edges.npz")
-    recipes = pd.read_csv(DATA_DIR / "recipes.csv")
+def load_data(device, data_dir=DATA_DIR):
+    data_dir = Path(data_dir)
+    edges = np.load(data_dir / "edges.npz")
+    recipes = pd.read_csv(data_dir / "recipes.csv")
     ingredient_x = torch.from_numpy(
-        np.load(DATA_DIR / "ingredient_x.npy")
+        np.load(data_dir / "ingredient_x.npy")
     ).float().to(device)
     all_edges = edges["all"].astype(np.int64)
-    all_weights = np.load(DATA_DIR / "edge_weights.npz")["all"].astype(np.float32)
+    all_weights = np.load(data_dir / "edge_weights.npz")["all"].astype(np.float32)
     heldout = recipes["heldout"].to_numpy(dtype=bool)
     recipe_ingredients = [
         set(all_edges[1, all_edges[0] == recipe_id])
@@ -55,7 +60,7 @@ def load_data(device):
         recipe_weights.append(dict(zip(all_edges[1, positions], all_weights[positions])))
     train_edges = torch.from_numpy(edges["train"]).long().to(device)
     train_edge_weights = torch.from_numpy(
-        np.load(DATA_DIR / "edge_weights.npz")["train"]
+        np.load(data_dir / "edge_weights.npz")["train"]
     ).float().to(device)
     return (
         all_edges, train_edges, train_edge_weights, heldout,
@@ -130,7 +135,7 @@ def recipe_features(edge_index, ingredient_x, n_recipes, edge_weights=None):
     else:
         degree = torch.bincount(edge_index[0], minlength=n_recipes)
     features.index_add_(0, edge_index[0], values)
-    degree = degree.clamp(min=1)
+    degree = degree.clamp(min=1e-12)
     return features / degree.unsqueeze(1)
 
 
@@ -154,6 +159,40 @@ def merge_graphs(
     )
 
 
+def embed_new_recipes(model, node_x, graph_edges, graph_weights, ingredient_x,
+                      n_recipes, recipes, batch_size=256):
+    """Embed independent new recipes without changing the reference graph.
+
+    Each recipe is (ingredient IDs, edge weights). The function is differentiable;
+    callers use no_grad for evaluation. Only ingredient -> query edges are added.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive.")
+    if not recipes:
+        return node_x.new_empty((0, model.embedding_dim))
+    outputs = []
+    n_nodes = len(node_x)
+    for start in range(0, len(recipes), batch_size):
+        chunk = recipes[start:start + batch_size]
+        sources, targets, values, features = [], [], [], []
+        for row, (ids, weights) in enumerate(chunk):
+            ids = torch.as_tensor(ids, dtype=torch.long, device=node_x.device)
+            weights = torch.as_tensor(weights, dtype=node_x.dtype, device=node_x.device)
+            if (not len(ids) or weights.shape != ids.shape or not torch.isfinite(weights).all()
+                    or (weights <= 0).any() or (ids < 0).any() or (ids >= len(ingredient_x)).any()):
+                raise ValueError("Recipes need valid ingredient IDs and aligned positive weights.")
+            sources.append(ids + n_recipes)
+            targets.append(torch.full_like(ids, n_nodes + row))
+            values.append(weights)
+            features.append((ingredient_x[ids] * weights[:, None]).sum(0) / weights.sum())
+        extra_edges = torch.stack([torch.cat(sources), torch.cat(targets)])
+        embeddings = model(torch.cat([node_x, torch.stack(features)]),
+                           torch.cat([graph_edges, extra_edges], dim=1),
+                           torch.cat([graph_weights, torch.cat(values)]))
+        outputs.append(F.normalize(embeddings[n_nodes:], dim=1))
+    return torch.cat(outputs)
+
+
 class WeightedSAGEConv(nn.Module):
     """GraphSAGE layer with a mean aggregator that weights neighbours by edge weight."""
 
@@ -174,10 +213,11 @@ class WeightedSAGEConv(nn.Module):
 class GCNModel(nn.Module):
     """Two GCN layers."""
 
-    def __init__(self, input_dim):
+    def __init__(self, input_dim, hidden=HIDDEN, embedding_dim=EMBEDDING_DIM):
         super().__init__()
-        self.conv1 = GCNConv(input_dim, HIDDEN)
-        self.conv2 = GCNConv(HIDDEN, EMBEDDING_DIM)
+        self.embedding_dim = embedding_dim
+        self.conv1 = GCNConv(input_dim, hidden)
+        self.conv2 = GCNConv(hidden, embedding_dim)
 
     def forward(self, node_x, edge_index, edge_weight):
         """Raw embeddings, used by the loss. Normalise them for retrieval."""
@@ -188,10 +228,11 @@ class GCNModel(nn.Module):
 class GraphSAGEModel(nn.Module):
     """Two GraphSAGE layers with edge-weighted mean aggregation."""
 
-    def __init__(self, input_dim):
+    def __init__(self, input_dim, hidden=HIDDEN, embedding_dim=EMBEDDING_DIM):
         super().__init__()
-        self.conv1 = WeightedSAGEConv(input_dim, HIDDEN)
-        self.conv2 = WeightedSAGEConv(HIDDEN, EMBEDDING_DIM)
+        self.embedding_dim = embedding_dim
+        self.conv1 = WeightedSAGEConv(input_dim, hidden)
+        self.conv2 = WeightedSAGEConv(hidden, embedding_dim)
 
     def forward(self, node_x, edge_index, edge_weight):
         """Raw embeddings, used by the loss. Normalise them for retrieval."""
@@ -202,20 +243,34 @@ class GraphSAGEModel(nn.Module):
 MODELS = {"gcn": GCNModel, "graphsage": GraphSAGEModel}
 
 
-def train(model_name, steps, seed):
+def train(model_name, steps, seed, data_dir=DATA_DIR, output_dir=OUTPUT_DIR,
+          device=None, threads=None):
+    if steps < 1:
+        raise ValueError("steps must be positive.")
+    data_dir, output_dir = Path(data_dir), Path(output_dir)
+    if threads is not None:
+        if threads < 1:
+            raise ValueError("threads must be positive.")
+        torch.set_num_threads(threads)
     torch.manual_seed(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    fingerprints = data_fingerprints(data_dir)
     (
         all_edges, train_edge_index, train_edge_weights, heldout,
         recipe_ingredients, recipe_weights, ingredient_x,
-    ) = load_data(device)
-    train_ids = np.flatnonzero(~heldout)
-    test_ids = np.flatnonzero(heldout)
+    ) = load_data(device, data_dir)
+    train_ids = np.unique(train_edge_index[0].cpu().numpy())
+    if not len(train_ids) or heldout[train_ids].any():
+        raise ValueError("Training graph must be nonempty and exclude reserved held-out recipes.")
+    known = np.zeros(len(heldout), dtype=bool)
+    known[train_ids] = True
+    test_ids = np.flatnonzero(~known)
     n_recipes = len(recipe_ingredients)
 
-    recipe_x = torch.from_numpy(
-        np.load(DATA_DIR / "recipe_x_train_weighted.npy")
-    ).float().to(device)
+    # Derive inputs from the actual training graph, never a stale feature cache.
+    recipe_x = torch.from_numpy(pooled_recipe_features(
+        train_edge_index.cpu().numpy(), ingredient_x.cpu().numpy(), n_recipes,
+        train_edge_weights.cpu().numpy())).to(device)
     graph_edges = bidirectional_edges(train_edge_index, n_recipes)
     graph_edge_weights = torch.cat([train_edge_weights, train_edge_weights])
     node_x = torch.cat([recipe_x, ingredient_x])
@@ -227,6 +282,8 @@ def train(model_name, steps, seed):
 
     model = MODELS[model_name](node_x.shape[1]).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    losses = []
+    training_started = time.perf_counter()
     for step in range(1, steps + 1):
         model.train()
         anchors, contexts, negatives = sample_walk_pairs(
@@ -234,11 +291,15 @@ def train(model_name, steps, seed):
         )
         embeddings = model(node_x, graph_edges, graph_edge_weights)
         loss = random_walk_loss(embeddings, anchors, contexts, negatives)
+        if not torch.isfinite(loss):
+            raise ValueError(f"Non-finite training loss at step {step}.")
+        losses.append(float(loss.detach()))
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         if step % EVAL_EVERY == 0 or step == steps:
             print(f"step {step:4d} loss {loss.item():.4f}")
+    training_seconds = time.perf_counter() - training_started
 
     model.eval()
     with torch.no_grad():
@@ -247,45 +308,26 @@ def train(model_name, steps, seed):
             model(train_node_x, graph_edges, graph_edge_weights), dim=1
         ).cpu().numpy()
 
-        heldout_features = recipe_x[test_ids]
-        heldout_lists = [recipe_ingredients[recipe_id] for recipe_id in test_ids]
-        heldout_weights = [recipe_weights[recipe_id] for recipe_id in test_ids]
-        rows, cols, weights = [], [], []
+        query_recipes = []
+        for recipe_id in test_ids:
+            ids = np.array(sorted(recipe_ingredients[recipe_id]), dtype=np.int64)
+            query_recipes.append((ids, np.array([recipe_weights[recipe_id][i] for i in ids])))
+        test_embeddings = embed_new_recipes(
+            model, node_x, graph_edges, graph_edge_weights, ingredient_x,
+            n_recipes, query_recipes).cpu().numpy()
 
-        for row, ids in enumerate(heldout_lists):
-            rows.extend(n_recipes + ingredient_id for ingredient_id in ids)
-            cols.extend(len(train_node_x) + row for _ in ids)
-            weights.extend(heldout_weights[row][ingredient_id] for ingredient_id in ids)
-
-        new_edges = torch.tensor([rows, cols], dtype=torch.long, device=device)
-        new_edge_weights = torch.tensor(weights, dtype=torch.float32, device=device)
-        heldout_edges = torch.cat([new_edges, new_edges.flip(0)], dim=1)
-        heldout_edge_weights = torch.cat([new_edge_weights, new_edge_weights])
-
-        all_node_x, all_graph_edges, all_edge_weights = merge_graphs(
-            train_node_x,
-            graph_edges,
-            graph_edge_weights,
-            heldout_features,
-            heldout_edges,
-            heldout_edge_weights,
-        )
-        test_embeddings = F.normalize(model(
-            all_node_x, all_graph_edges, all_edge_weights
-        ), dim=1)[len(train_node_x):len(train_node_x) + len(heldout_features)].cpu().numpy()
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
     embedding_recipe_ids = np.concatenate([train_ids, test_ids])
     embedding_values = np.concatenate(
         [train_embeddings[train_ids], test_embeddings], axis=0
     )
     embedding_order = np.argsort(embedding_recipe_ids)
     np.savez(
-        OUTPUT_DIR / f"{model_name}_inductive_s{seed}_embeddings.npz",
+        output_dir / f"{model_name}_inductive_s{seed}_embeddings.npz",
         embeddings=embedding_values[embedding_order],
         recipe_id=embedding_recipe_ids[embedding_order],
         split=np.where(
-            heldout[embedding_recipe_ids[embedding_order]], "test", "train"
+            known[embedding_recipe_ids[embedding_order]], "train", "unseen"
         ),
     )
     
@@ -298,14 +340,27 @@ def train(model_name, steps, seed):
         "walk_length": WALK_LENGTH,
         "negatives": NEGATIVES,
         "negative_power": NEGATIVE_POWER,
-        "heldout_queries": len(test_ids),
+        "heldout_queries": int(heldout.sum()),
+        "unseen_queries": len(test_ids),
+        "data_sha256": fingerprints,
+        "training_feature_scheme": FEATURE_SCHEME,
+        "inference_policy": INFERENCE_POLICY,
+        "input_dim": int(ingredient_x.shape[1]), "hidden": HIDDEN, "out": EMBEDDING_DIM,
+        "learning_rate": 1e-3, "weight_decay": 1e-5,
+        "negative_loss_weight": 1.0,
+        "substitution_supervision": False,
+        "parameters": sum(p.numel() for p in model.parameters()),
+        "training_loss_first": losses[0], "training_loss_last": losses[-1],
+        "device": str(device),
+        "training_seconds": training_seconds,
     }
 
     torch.save({"state_dict": model.state_dict(), "config": config},
-               OUTPUT_DIR / f"{model_name}_inductive_s{seed}.pt")
-    (OUTPUT_DIR / f"{model_name}_inductive_s{seed}.json").write_text(
+               output_dir / f"{model_name}_inductive_s{seed}.pt")
+    (output_dir / f"{model_name}_inductive_s{seed}.json").write_text(
         json.dumps(config, indent=2)
     )
+    return config
 
 
 def main():
@@ -313,8 +368,12 @@ def main():
     parser.add_argument("model", choices=list(MODELS), default="gcn", nargs="?")
     parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    parser.add_argument("--device", choices=["cpu", "cuda"])
+    parser.add_argument("--threads", type=int, help="CPU threads; useful for reproducible pilot runs.")
     args = parser.parse_args()
-    train(args.model, args.steps, args.seed)
+    train(args.model, args.steps, args.seed, args.data_dir, args.output_dir, args.device, args.threads)
 
 
 if __name__ == "__main__":

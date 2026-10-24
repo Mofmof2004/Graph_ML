@@ -20,7 +20,9 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
-from train_recipe_similarity import MODELS, bidirectional_edges
+from train_recipe_similarity import MODELS, bidirectional_edges, embed_new_recipes
+from graph_features import (FEATURE_SCHEME, INFERENCE_POLICY, data_fingerprints,
+                            pooled_recipe_features)
 
 
 DATA_DIR = Path("data/processed")
@@ -43,6 +45,7 @@ class RecipeData:
     known: np.ndarray          # recipe has edges in the training graph
     train_edges: np.ndarray
     train_weights: np.ndarray
+    directory: Path = Path("data/processed")
 
     def weights(self, ids, shares):
         """Edge weights as in build_graph.py: idf * share ** share_exponent."""
@@ -57,13 +60,14 @@ class RecipeData:
         return ids, self.weights(ids, self.recipe_shares[recipe_id])
 
 
-def load_data():
-    edges = np.load(DATA_DIR / "edges.npz")
-    weights = np.load(DATA_DIR / "edge_weights.npz")
-    ingredients = pd.read_csv(DATA_DIR / "ingredients.csv")
-    n_recipes = len(pd.read_csv(DATA_DIR / "recipes.csv"))
+def load_data(directory=DATA_DIR):
+    directory = Path(directory)
+    edges = np.load(directory / "edges.npz")
+    weights = np.load(directory / "edge_weights.npz")
+    ingredients = pd.read_csv(directory / "ingredients.csv")
+    n_recipes = len(pd.read_csv(directory / "recipes.csv"))
     n_ingredients = len(ingredients)
-    with open(DATA_DIR / "config.json") as f:
+    with open(directory / "config.json") as f:
         share_exponent = json.load(f)["share_exponent"]
 
     # IDF exactly as in build_graph.py (ingredients.csv only stores it rounded)
@@ -81,8 +85,8 @@ def load_data():
 
     return RecipeData(
         n_recipes, n_ingredients, ingredients,
-        np.load(DATA_DIR / "ingredient_x.npy").astype(np.float32), idf, share_exponent,
-        recipe_ingredients, recipe_shares, known, train, weights["train"],
+        np.load(directory / "ingredient_x.npy").astype(np.float32), idf, share_exponent,
+        recipe_ingredients, recipe_shares, known, train, weights["train"], directory,
     )
 
 
@@ -138,42 +142,48 @@ class Node2VecMethod:
 
 
 class GNNMethod:
-    """A trained GCNModel / GraphSAGEModel checkpoint. Recipes in the training graph
+    """A trained two-layer GCN or GraphSAGE checkpoint. Recipes in the training graph
     are embedded in it; any other recipe is attached as a new node with edges from
     its ingredients only, so new recipes never influence each other or the graph."""
     inductive = True
 
-    def __init__(self, data, model_name, seed, name=None):
+    def __init__(self, data, model_name, seed, name=None, checkpoint_path=None,
+                 device="cpu", batch_size=256):
         self.data, self.model_name, self.seed = data, model_name, seed
         self.name = name or model_name
-        checkpoint = torch.load(SIMILARITY_DIR / f"{model_name}_inductive_s{seed}.pt",
-                                map_location="cpu", weights_only=True)
-        recipe_x = torch.from_numpy(np.load(DATA_DIR / "recipe_x_train_weighted.npy")).float()
-        self.node_x = torch.cat([recipe_x, torch.from_numpy(data.ingredient_x)])
-        self.edges = bidirectional_edges(torch.from_numpy(data.train_edges).long(), data.n_recipes)
-        self.edge_weights = torch.from_numpy(np.tile(data.train_weights, 2)).float()
-        self.model = MODELS[model_name](self.node_x.shape[1])
+        self.device, self.batch_size = torch.device(device), batch_size
+        self.checkpoint_path = Path(checkpoint_path or SIMILARITY_DIR / f"{model_name}_inductive_s{seed}.pt")
+        checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=True)
+        config = checkpoint["config"]
+        expected = {"model": model_name, "seed": seed,
+                    "input_dim": int(data.ingredient_x.shape[1]),
+                    "data_sha256": data_fingerprints(data.directory),
+                    "training_feature_scheme": FEATURE_SCHEME,
+                    "inference_policy": INFERENCE_POLICY}
+        for key, value in expected.items():
+            if config.get(key) != value:
+                raise ValueError(f"{self.checkpoint_path}: checkpoint {key} does not match. Retrain for this data/protocol.")
+        self.config = config
+        recipe_x = pooled_recipe_features(data.train_edges, data.ingredient_x,
+                                          data.n_recipes, data.train_weights)
+        self.ingredient_x = torch.as_tensor(data.ingredient_x, device=self.device)
+        self.node_x = torch.cat([torch.as_tensor(recipe_x, device=self.device), self.ingredient_x])
+        self.edges = bidirectional_edges(torch.as_tensor(data.train_edges, device=self.device), data.n_recipes)
+        self.edge_weights = torch.as_tensor(np.tile(data.train_weights, 2), device=self.device).float()
+        self.model = MODELS[model_name](self.node_x.shape[1], config["hidden"], config["out"]).to(self.device)
         self.model.load_state_dict(checkpoint["state_dict"])
         self.model.eval()
 
     @torch.no_grad()
     def embed(self, recipes):
-        n_nodes, n_recipes = len(self.node_x), self.data.n_recipes
-        source = np.concatenate([n_recipes + ids for ids, _ in recipes])
-        target = np.concatenate([np.full(len(ids), n_nodes + row) for row, (ids, _) in enumerate(recipes)])
-        weights = np.concatenate([w for _, w in recipes]).astype(np.float32)
-        new_x = torch.from_numpy(SentenceMean(self.data).embed(recipes)).float()
-        embeddings = self.model(
-            torch.cat([self.node_x, new_x]),
-            torch.cat([self.edges, torch.from_numpy(np.stack([source, target])).long()], dim=1),
-            torch.cat([self.edge_weights, torch.from_numpy(weights)]),
-        )
-        return F.normalize(embeddings, dim=1)[n_nodes:].numpy()
+        return embed_new_recipes(self.model, self.node_x, self.edges, self.edge_weights,
+                                 self.ingredient_x, self.data.n_recipes, recipes,
+                                 self.batch_size).cpu().numpy()
 
     @torch.no_grad()
     def recipes(self):
         embeddings = F.normalize(self.model(self.node_x, self.edges, self.edge_weights), dim=1)
-        embeddings = embeddings[:self.data.n_recipes].numpy().copy()
+        embeddings = embeddings[:self.data.n_recipes].cpu().numpy().copy()
         unseen = np.flatnonzero(~self.data.known)
         embeddings[unseen] = self.embed([self.data.recipe(r) for r in unseen])
         return embeddings

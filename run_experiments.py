@@ -2,11 +2,11 @@
 
     python run_experiments.py                       # all evaluations, GNN seeds 0 1 2
     python run_experiments.py --only substitution   # a subset
-    python run_experiments.py --only substitution_benchmark  # frozen baseline comparison, no training
+    python run_experiments.py --only substitution_benchmark  # frozen comparison, no training
     python run_experiments.py --retrain             # retrain the GNN checkpoints first
 
 Missing GNN checkpoints (and the Node2Vec embeddings) are trained for the original evaluations.
-The optional substitution_benchmark runs baselines without training checkpoints.
+The optional substitution_benchmark evaluates baselines and supplied --checkpoints without training.
 
 Output, under results/<timestamp>/ by default:
     config.json         arguments, git commit, method list
@@ -219,11 +219,14 @@ def substitution(data, methods, embeddings, out):
     return metrics
 
 
-def substitution_benchmark(out):
-    """Run the frozen validation comparison of substitution baselines."""
+def substitution_benchmark(out, checkpoints=()):
+    """Compare baselines and optional trained checkpoints on frozen validation cases."""
     import evaluate_substitutions as benchmark
 
-    report = benchmark.evaluate(benchmark.parse_args(["--output-dir", str(out)]))
+    argv = ["--output-dir", str(out)]
+    if checkpoints:
+        argv += ["--checkpoints", *map(str, checkpoints)]
+    report = benchmark.evaluate(benchmark.parse_args(argv))
     return [{"evaluation": "substitution_benchmark", "metric": f"{metric}_{stratum}",
              "method": run["method"], "seed": run["seed"], "value": metrics[metric]}
             for run in report["runs"]
@@ -353,7 +356,11 @@ def main():
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     parser.add_argument("--steps", type=int, default=1000, help="training steps for missing checkpoints")
     parser.add_argument("--retrain", action="store_true")
+    parser.add_argument("--checkpoints", type=Path, nargs="+", default=[],
+                        help="Existing checkpoints for --only substitution_benchmark; never trained by that task.")
     args = parser.parse_args()
+    if args.checkpoints and "substitution_benchmark" not in args.only:
+        parser.error("--checkpoints requires --only substitution_benchmark.")
 
     data, methods, embeddings = None, [], {}
     if any(name != "substitution_benchmark" for name in args.only):
@@ -373,7 +380,7 @@ def main():
         folder = args.out / name
         folder.mkdir(exist_ok=True)
         if name == "substitution_benchmark":
-            metrics += substitution_benchmark(folder)
+            metrics += substitution_benchmark(folder, args.checkpoints)
         else:
             metrics += EVALUATIONS[name](data, methods, embeddings, folder)
 
@@ -381,6 +388,7 @@ def main():
     (args.out / "config.json").write_text(json.dumps({
         "evaluations": args.only, "seeds": args.seeds, "git_commit": commit,
         "methods": metrics["method"].drop_duplicates().tolist(),
+        "checkpoints": [str(path.resolve()) for path in args.checkpoints],
         "probe_ingredients": PROBE_INGREDIENTS, "substitution_cases": SUBSTITUTION_CASES,
     }, indent=2))
     metrics.to_csv(args.out / "metrics.csv", index=False)

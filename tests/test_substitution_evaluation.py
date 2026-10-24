@@ -1,5 +1,6 @@
 """Protocol and numerical checks using a small, fully local recipe graph."""
 
+import importlib.util
 import contextlib
 import io
 import json
@@ -204,6 +205,100 @@ class SubstitutionEvaluationTests(unittest.TestCase):
         np.savez(self.data_dir / "edge_weights.npz", **weights)
         with self.assertRaisesRegex(ValueError, "Training weights do not match"):
             evaluation.BenchmarkData.load(self.data_dir)
+
+
+    def test_features_keep_global_ids_and_normalize_small_total_weights(self):
+        from graph_features import pooled_recipe_features
+        edges = np.array([[0, 0, 2], [0, 1, 2]])
+        features = np.eye(3, dtype=np.float32)
+        pooled = pooled_recipe_features(edges, features, 4, np.array([0.1, 0.2, 0.1]))
+        np.testing.assert_allclose(pooled[0], [1 / 3, 2 / 3, 0])
+        np.testing.assert_array_equal(pooled[1], 0)
+        np.testing.assert_array_equal(pooled[2], [0, 0, 1])
+
+
+    @unittest.skipUnless(importlib.util.find_spec("torch_geometric"), "PyTorch Geometric is not installed")
+    def test_checkpoint_inference_has_no_query_to_query_influence(self):
+        import torch
+        from train_recipe_similarity import MODELS, train
+        from embedders import GNNMethod, load_data
+        previous_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        self.addCleanup(torch.set_num_threads, previous_threads)
+        cases = self.cases()
+        original, plausible, random_, shares = evaluation.variants(cases)
+        weights = evaluation.ingredient_weights(self.data, original, shares)
+        recipes = list(zip(original, weights))
+        paths = []
+        graph = load_data(self.data_dir)
+        self.assertFalse((self.data_dir / "recipe_x_train_weighted.npy").exists())
+        for name in MODELS:
+            with self.subTest(model=name), contextlib.redirect_stdout(io.StringIO()):
+                train(name, 2, 0, self.data_dir, self.folder, device="cpu", threads=1)
+                path = self.folder / f"{name}_inductive_s0.pt"
+                paths.append(path)
+                adapter = GNNMethod(graph, name, 0, checkpoint_path=path, batch_size=1)
+                separate = adapter.embed(recipes)
+                adapter.batch_size = len(recipes)
+                batch = adapter.embed(recipes)
+                np.testing.assert_allclose(batch, separate, atol=1e-6)
+                np.testing.assert_allclose(adapter.embed(recipes[::-1])[::-1], batch, atol=1e-6)
+                self.assertTrue(np.isfinite(batch).all())
+                with np.load(self.folder / f"{name}_inductive_s0_embeddings.npz") as exported:
+                    np.testing.assert_allclose(adapter.recipes(), exported["embeddings"], atol=1e-6)
+                base = adapter.model(adapter.node_x, adapter.edges, adapter.edge_weights).detach().clone()
+                adapter.embed(recipes)
+                torch.testing.assert_close(base, adapter.model(adapter.node_x, adapter.edges, adapter.edge_weights))
+                checkpoint = torch.load(path, weights_only=True)
+                checkpoint["config"]["data_sha256"]["edges.npz"] = "stale"
+                stale = self.folder / f"{name}_stale.pt"
+                torch.save(checkpoint, stale)
+                with self.assertRaisesRegex(ValueError, "checkpoint data_sha256"):
+                    GNNMethod(graph, name, 0, checkpoint_path=stale)
+        with contextlib.redirect_stdout(io.StringIO()):
+            report = evaluation.evaluate(self.args("--checkpoints", *map(str, paths)))
+        for name in MODELS:
+            self.assertIn(f"learned/{name}", report["paired_comparisons"])
+            self.assertIsNone(report["methods"][f"learned/{name}"]["all"]["seed_macro_std"])
+
+    @unittest.skipUnless(importlib.util.find_spec("torch_geometric"), "PyTorch Geometric is not installed")
+    def test_checkpoint_seeds_share_cases_and_reject_mixed_configurations(self):
+        import torch
+        from train_recipe_similarity import train
+        from embedders import GNNMethod, load_data
+
+        previous_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        self.addCleanup(torch.set_num_threads, previous_threads)
+        paths = [self.folder / f"gcn_inductive_s{seed}.pt" for seed in [0, 1]]
+        with contextlib.redirect_stdout(io.StringIO()):
+            for seed in [0, 1]:
+                train("gcn", 2, seed, self.data_dir, self.folder, device="cpu", threads=1)
+            report = evaluation.evaluate(self.args("--checkpoints", *map(str, paths)))
+        learned = report["methods"]["learned/gcn"]["all"]
+        per_seed = [run["metrics"]["all"]["macro_accuracy"] for run in report["runs"]
+                    if run["method"] == "learned/gcn"]
+        self.assertEqual(learned["runs"], 2)
+        self.assertAlmostEqual(learned["macro_accuracy"], np.mean(per_seed))
+        self.assertAlmostEqual(learned["seed_macro_std"], np.std(per_seed))
+        scores = pd.read_csv(self.folder / "results/scores.csv")
+        expected_cases = set(scores["case_id"])
+        for _, rows in scores.groupby(["method", "seed"], dropna=False):
+            self.assertEqual(set(rows["case_id"]), expected_cases)
+        checkpoint = torch.load(paths[1], weights_only=True)
+        checkpoint["config"]["steps"] = 123
+        mismatched = self.folder / "different_budget.pt"
+        torch.save(checkpoint, mismatched)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "different training configurations"):
+            evaluation.evaluate(self.args("--checkpoints", str(paths[0]), str(mismatched)))
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "Duplicate method/seed"):
+            evaluation.evaluate(self.args("--checkpoints", str(paths[0]), str(paths[0])))
+        del checkpoint["config"]["inference_policy"]
+        legacy = self.folder / "legacy.pt"
+        torch.save(checkpoint, legacy)
+        with self.assertRaisesRegex(ValueError, "checkpoint inference_policy"):
+            GNNMethod(load_data(self.data_dir), "gcn", 1, checkpoint_path=legacy)
+
 
 
 if __name__ == "__main__":

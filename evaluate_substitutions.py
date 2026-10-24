@@ -2,7 +2,8 @@
 
 The default methods use existing ingredient features and run without downloads.
 Add --methods jaccard mean weighted_mean sbert for the sentence-list baseline.
-Learned-model comparisons are a separate integration step.
+Add --checkpoints PATH [PATH ...] to compare trained two-layer GCN/GraphSAGE models.
+Checkpoints must match the data, training feature scheme and inference policy.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import argparse
 import hashlib
 import json
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 
 import numpy as np
@@ -345,6 +347,45 @@ def baseline_runs(data, methods, copies, batch_size, device):
         yield {"method": method, "seed": None, "checkpoint": None}, a, b
 
 
+def checkpoint_runs(data, paths, copies, batch_size, device, threads=None):
+    if not paths:
+        return
+    import torch
+    if threads is not None:
+        torch.set_num_threads(threads)
+    from embedders import GNNMethod, load_data
+    from train_recipe_similarity import MODELS
+
+    original, plausible, random_, shares = copies
+    graph = load_data(data.directory)
+    configurations = {}
+    for path in paths:
+        checkpoint = torch.load(path, map_location=device, weights_only=True)
+        config = checkpoint["config"]
+        model_name = config.get("model")
+        if model_name not in MODELS:
+            raise ValueError(f"{path}: unsupported model {model_name!r}; expected {list(MODELS)}.")
+        # Different seeds are repeats only when their training setup is the same.
+        settings = {key: config.get(key) for key in [
+            "steps", "loss", "batch_nodes", "walk_length", "negatives", "negative_power",
+            "input_dim", "hidden", "out", "learning_rate", "weight_decay", "negative_loss_weight",
+            "substitution_supervision", "training_feature_scheme", "inference_policy"]}
+        if model_name in configurations and settings != configurations[model_name]:
+            raise ValueError(f"{path}: cannot aggregate different training configurations for {model_name}.")
+        configurations[model_name] = settings
+        adapter = GNNMethod(graph, model_name, int(config["seed"]), checkpoint_path=path,
+                            device=device, batch_size=batch_size)
+
+        def embed(lists):
+            return adapter.embed(list(zip(lists, ingredient_weights(data, lists, shares))))
+
+        z_original = embed(original)
+        a, b = cosine_scores(z_original, embed(plausible)), cosine_scores(z_original, embed(random_))
+        yield {"method": f"learned/{model_name}", "seed": int(config["seed"]),
+               "checkpoint": str(path.resolve()), "checkpoint_sha256": digest(path),
+               "training": config}, a, b
+
+
 def write_comparison_outputs(report, rows, output):
     """Render the same saved metrics into a compact report and optional plot."""
     headline = [row for row in rows if row["stratum"] == "all"]
@@ -360,6 +401,12 @@ def write_comparison_outputs(report, rows, output):
         lo, hi = row["macro_ci95"]
         lines.append(f"| {row['method']} | {row['micro_accuracy']:.4f} | "
                      f"{row['macro_accuracy']:.4f} | [{lo:.4f}, {hi:.4f}] | {row['runs']} |")
+    trained = [run["training"] for run in report["runs"] if "training" in run]
+    if trained:
+        budgets = sorted({config["steps"] for config in trained})
+        seeds = sorted({config["seed"] for config in trained})
+        lines += ["", f"Learned-model training budgets: {budgets} optimizer steps per run; seeds {seeds}. "
+                  "The training budget alone does not establish convergence."]
     lines += ["", f"Paired differences against **{report['scoring']['reference']}**:", ""]
     for name, comparison in report["paired_comparisons"].items():
         row = comparison["all"]
@@ -372,7 +419,7 @@ def write_comparison_outputs(report, rows, output):
               "The confidence interval measures variability across substitution pairs, not across training runs.",
               "- Binary Jaccard should tie at 0.5: both variants change exactly one ingredient.",
               "- Node2Vec is omitted because it cannot embed these new recipe variants without an additional method.",
-              "- Dataset, implementation and case hashes are recorded in summary.json. Cached graph split "
+              "- Dataset, checkpoint, implementation and case hashes are recorded in summary.json. Cached graph split "
               "overlaps are recorded separately; benchmark recipes must always be absent from training edges.", ""]
     (output / "comparison.md").write_text("\n".join(lines), encoding="utf-8")
     try:
@@ -413,10 +460,11 @@ def evaluate(args):
     groups, records, run_reports = {}, [], []
     seen = set()
     runs = baseline_runs(data, args.methods, copies, args.batch_size, args.device)
-    for info, plausible, random_ in runs:
+    for info, plausible, random_ in chain(runs, checkpoint_runs(
+            data, args.checkpoints, copies, args.batch_size, args.device, args.threads)):
         identity = (info["method"], info["seed"])
         if identity in seen:
-            raise ValueError(f"Duplicate method/seed: {identity}. Specify each baseline only once.")
+            raise ValueError(f"Duplicate method/seed: {identity}. Provide one checkpoint per model/seed.")
         seen.add(identity)
         wins, margins = wins_from_scores(plausible, random_, args.tie_tolerance)
         groups.setdefault(info["method"], []).append((wins, margins))
@@ -446,7 +494,9 @@ def evaluate(args):
                    for name, (wins, _) in averaged.items() if name != args.reference}
     report = {"format_version": FORMAT_VERSION, "cases_file": str(cases_path.resolve()),
               "implementation_sha256": {name: digest(ROOT / name) for name in
-                                         ["evaluate_substitutions.py", "normalisation.py"]},
+                                         ["evaluate_substitutions.py", "normalisation.py"] +
+                                         (["graph_features.py", "train_recipe_similarity.py", "embedders.py"]
+                                          if args.checkpoints else [])},
               "cases_sha256": manifest["cases_sha256"], "data_sha256": data.fingerprints,
               "substitutions_file": str(substitutions.resolve()),
               "substitutions_sha256": manifest["substitutions_sha256"], "protocol": protocol,
@@ -459,7 +509,8 @@ def evaluate(args):
                           "random_frequency": "training-edge frequency rank",
                           "idf": "unrounded; recomputed from training edges",
                           "evaluation_population": "reserved recipes, partitioned into validation and test",
-                          "seed_std_ddof": 0},
+                          "seed_std_ddof": 0,
+                          "cpu_threads": args.threads if args.checkpoints else None},
               "methods": summaries, "runs": run_reports, "paired_comparisons": comparisons}
     output.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(records).to_csv(output / "scores.csv", index=False)
@@ -485,6 +536,9 @@ def parse_args(argv=None):
     parser.add_argument("--methods", nargs="+", choices=BASELINES, default=list(BASELINES[:4]))
     parser.add_argument("--reference", choices=BASELINES, default="weighted_mean",
                         help="Select on validation data before running the final test.")
+    parser.add_argument("--checkpoints", type=Path, nargs="+", default=[],
+                        help="Trained two-layer GCN/GraphSAGE checkpoints; no training is performed.")
+    parser.add_argument("--threads", type=int, default=2, help="CPU threads for learned-model evaluation.")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--tie-tolerance", type=float, default=1e-7)
@@ -501,6 +555,11 @@ def parse_args(argv=None):
         parser.error("--reference must be included in --methods.")
     if len(set(args.methods)) != len(args.methods):
         parser.error("--methods must not contain duplicates.")
+    if args.threads < 1:
+        parser.error("--threads must be positive.")
+    for checkpoint in args.checkpoints:
+        if not checkpoint.is_file():
+            parser.error(f"Checkpoint does not exist: {checkpoint}")
     return args
 
 
