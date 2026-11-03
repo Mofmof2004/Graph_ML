@@ -144,11 +144,13 @@ class Node2VecMethod:
 class GNNMethod:
     """A trained two-layer GCN or GraphSAGE checkpoint. Recipes in the training graph
     are embedded in it; any other recipe is attached as a new node with edges from
-    its ingredients only, so new recipes never influence each other or the graph."""
+    its ingredients only, so new recipes never influence each other or the graph.
+    That makes the batch size a speed setting only: every batch is a pass over the
+    whole graph, so large batches are much faster."""
     inductive = True
 
     def __init__(self, data, model_name, seed, name=None, checkpoint_path=None,
-                 device="cpu", batch_size=256):
+                 device="cpu", batch_size=8192):
         self.data, self.model_name, self.seed = data, model_name, seed
         self.name = name or model_name
         self.device, self.batch_size = torch.device(device), batch_size
