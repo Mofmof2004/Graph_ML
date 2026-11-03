@@ -51,6 +51,9 @@ PROBE_INGREDIENTS = 100
 MIN_RECIPES = 10             
 MIN_UNSEEN_POSITIVES = 5     
 SUBSTITUTION_CASES = 3000
+SUBSTITUTION_SEED = 1        # not SEED: build_graph.py shuffles the recipes into splits with
+                             # default_rng(SEED), so the same seed replays that order and every
+                             # case would come from the first split (held-out)
 RETRIEVAL_K = 10
 
 
@@ -163,7 +166,7 @@ def substitution_cases(data, rng):
 
 
 def substitution(data, methods, embeddings, out):
-    rng = np.random.default_rng(SEED)
+    rng = np.random.default_rng(SUBSTITUTION_SEED)
     cases = substitution_cases(data, rng)
     original = [data.recipe(r) for r, *_ in cases]
     substituted = [data.recipe(r, (p, b)) for r, p, a, b, x in cases]
