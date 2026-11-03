@@ -203,11 +203,14 @@ class WeightedSAGEConv(nn.Module):
 
     def forward(self, x, edge_index, edge_weight):
         source, target = edge_index
-        total = scatter(x[source] * edge_weight.unsqueeze(1), target, 0,
+        # Projecting before aggregating gives the same result (the weighted mean commutes
+        # with the bias-free neighbour_linear), with output_dim rather than input_dim per edge
+        messages = self.neighbour_linear(x)
+        total = scatter(messages[source] * edge_weight.unsqueeze(1), target, 0,
                         dim_size=len(x), reduce="sum")
         weight = scatter(edge_weight, target, 0, dim_size=len(x), reduce="sum")
         neighbours = total / weight.clamp(min=1e-12).unsqueeze(1)
-        return self.self_linear(x) + self.neighbour_linear(neighbours)
+        return self.self_linear(x) + neighbours
 
 
 class GCNModel(nn.Module):
