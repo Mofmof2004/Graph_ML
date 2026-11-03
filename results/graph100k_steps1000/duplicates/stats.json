@@ -1,0 +1,7 @@
+{
+  "title_groups": 6014.0,
+  "pairs": 75299.0,
+  "mean_jaccard_same_title": 0.2911548739772583,
+  "mean_jaccard_random": 0.053912701807381745,
+  "identical_ingredient_sets": 0.00046481360974249327
+}
