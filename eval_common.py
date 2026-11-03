@@ -52,7 +52,10 @@ def edge_weight(ids, shares, alpha=SHARE_EXPONENT):
 
 
 def matched_random(rng, target, exclude):
-    lo, hi = max(rank[target] - WINDOW, 0), min(rank[target] + WINDOW, n_ingredients - 1)
+    # The window stays symmetric near the ends of the ranking: cut off on one side only, it
+    # would make the random ingredient rarer than common targets (butter, sugar) on average
+    half = min(WINDOW, rank[target], n_ingredients - 1 - rank[target])
+    lo, hi = rank[target] - half, rank[target] + half
     for _ in range(50):
         c = order[rng.integers(lo, hi + 1)]
         if c not in exclude and c != target:
