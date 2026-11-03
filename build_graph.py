@@ -13,7 +13,10 @@ from graph_features import FEATURE_MODEL, encode_words, calculate_edge_weights
 
 RAW = "data/raw/RecipeNLG_dataset.csv"
 OUT = "data/interim"
-SLICE_SIZE = 10_000          # number of rows read from the CSV
+SLICE_SIZE = 100_000         # number of rows read from the CSV
+RANDOM_SLICE = True          # sample the rows at random from the whole CSV; False reads the first
+                             # SLICE_SIZE rows, which all come from cookbooks.com
+RAW_ROWS = 2_231_142         # rows in RecipeNLG_dataset.csv
 MIN_INGS = 2
 MIN_ING_COUNT = 5            # ingredient must appear in at least this many recipes
 DROP_INGREDIENTS = set()     # hub ingredients to remove, e.g. {"salt", "water"}, empty for now
@@ -27,14 +30,26 @@ TEST_FRAC = 0.10      # fraction of the non-heldout recipes used for testing
 
 PRINT_DATA_NORMALISATION = True
 
-COMPUTE_TITLE_FEATURES = True        # also embed recipe titles, as an optional extra
+COMPUTE_TITLE_FEATURES = False       # also embed recipe titles, as an optional extra; nothing
+                                     # reads the recipe_x_{split}.npy files it writes
 PROPERTIES = "data/ingredient_properties.csv"   # density (g/ml), piece and package weight per ingredient
 SHARE_EXPONENT = 0.5   # edge weight = idf * share ** SHARE_EXPONENT; 1 = linear share, 0 = idf only
 
 
 OUT = "data/processed"
 # Load the dataset
-slice_df = pd.read_csv(RAW, nrows=SLICE_SIZE, usecols=["title", "ingredients", "link", "source", "NER"])
+COLUMNS = ["title", "ingredients", "link", "source", "NER"]
+if RANDOM_SLICE:
+    # One pass over the file keeping a bit more than SLICE_SIZE rows, then trimmed to exactly
+    # SLICE_SIZE. The index stays the row number in the CSV, so row_id keeps its meaning.
+    slice_rng = np.random.default_rng(SEED)
+    keep_rate = 1.1 * SLICE_SIZE / RAW_ROWS
+    chunks = [chunk[slice_rng.random(len(chunk)) < keep_rate]
+              for chunk in pd.read_csv(RAW, usecols=COLUMNS, chunksize=200_000)]
+    pool = pd.concat(chunks)
+    slice_df = pool.sample(n=min(SLICE_SIZE, len(pool)), random_state=SEED).sort_index()
+else:
+    slice_df = pd.read_csv(RAW, nrows=SLICE_SIZE, usecols=COLUMNS)
 ner = slice_df["NER"].apply(json.loads)
 raw_counts = Counter(name for names in ner for name in names)
 total_mentions = sum(raw_counts.values())
@@ -309,7 +324,8 @@ if COMPUTE_TITLE_FEATURES:
 # Sanity check: do the ingredient features make sense?
 print("butter" in ing2id, len(ing2id), ingredient_names[:10])
 
-print(f"\ningredient_x {ingredient_x.shape}, recipe_x {recipe_x.shape}")
+print(f"\ningredient_x {ingredient_x.shape}"
+      + (f", recipe_x {recipe_x.shape}" if COMPUTE_TITLE_FEATURES else ""))
 for name in ["paprika", "butter", "cilantro", "beef"]:
     if name in ing2id:
         sims = ingredient_x @ ingredient_x[ing2id[name]]
@@ -366,7 +382,7 @@ stats = {
                         ingredients.nlargest(50, "recipe_count")[["name", "recipe_count"]].values],
 }
 config = {
-    "slice_size": SLICE_SIZE, "min_ings": MIN_INGS, "min_ing_count": MIN_ING_COUNT,
+    "slice_size": SLICE_SIZE, "random_slice": RANDOM_SLICE, "min_ings": MIN_INGS, "min_ing_count": MIN_ING_COUNT,
     "drop_ingredients": sorted(DROP_INGREDIENTS), "seed": SEED, "heldout_frac": HELDOUT_FRAC,
     "val_frac": VAL_FRAC, "test_frac": TEST_FRAC, "feature_model": FEATURE_MODEL,
     "edge_weight": "idf(train edges) * quantity share ** share_exponent",
