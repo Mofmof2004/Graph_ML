@@ -213,12 +213,36 @@ class WeightedSAGEConv(nn.Module):
         return self.self_linear(x) + neighbours
 
 
+class HeteroSAGEConv(nn.Module):
+    """WeightedSAGEConv with separate weights per node type (the self maps) and per edge
+    direction (ingredient -> recipe, recipe -> ingredient). The graph is bipartite, so a
+    message's direction is given by the type of the node it comes from."""
+
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.self_recipe = nn.Linear(input_dim, output_dim)
+        self.self_ingredient = nn.Linear(input_dim, output_dim)
+        self.ingredient_to_recipe = nn.Linear(input_dim, output_dim, bias=False)
+        self.recipe_to_ingredient = nn.Linear(input_dim, output_dim, bias=False)
+
+    def forward(self, x, edge_index, edge_weight, is_ingredient):
+        source, target = edge_index
+        ingredient = is_ingredient.unsqueeze(1)
+        own = torch.where(ingredient, self.self_ingredient(x), self.self_recipe(x))
+        messages = torch.where(ingredient, self.ingredient_to_recipe(x), self.recipe_to_ingredient(x))
+        total = scatter(messages[source] * edge_weight.unsqueeze(1), target, 0,
+                        dim_size=len(x), reduce="sum")
+        weight = scatter(edge_weight, target, 0, dim_size=len(x), reduce="sum")
+        neighbours = total / weight.clamp(min=1e-12).unsqueeze(1)
+        return own + neighbours
+
+
 class GCNModel(nn.Module):
     """Two GCN layers."""
 
     def __init__(self, input_dim, hidden=HIDDEN, embedding_dim=EMBEDDING_DIM):
         super().__init__()
-        self.embedding_dim = embedding_dim
+        self.hidden, self.embedding_dim = hidden, embedding_dim
         self.conv1 = GCNConv(input_dim, hidden)
         self.conv2 = GCNConv(hidden, embedding_dim)
 
@@ -233,7 +257,7 @@ class GraphSAGEModel(nn.Module):
 
     def __init__(self, input_dim, hidden=HIDDEN, embedding_dim=EMBEDDING_DIM):
         super().__init__()
-        self.embedding_dim = embedding_dim
+        self.hidden, self.embedding_dim = hidden, embedding_dim
         self.conv1 = WeightedSAGEConv(input_dim, hidden)
         self.conv2 = WeightedSAGEConv(hidden, embedding_dim)
 
@@ -243,7 +267,43 @@ class GraphSAGEModel(nn.Module):
         return self.conv2(hidden, edge_index, edge_weight)
 
 
-MODELS = {"gcn": GCNModel, "graphsage": GraphSAGEModel}
+class WideGraphSAGEModel(GraphSAGEModel):
+    """GraphSAGE with a 256-wide hidden layer, which gives it as many parameters as
+    HeteroGraphSAGEModel. Control: a gain of the hetero model over this one comes from the
+    type-specific weights, not from extra capacity."""
+
+    def __init__(self, input_dim, hidden=2 * HIDDEN, embedding_dim=EMBEDDING_DIM):
+        super().__init__(input_dim, hidden, embedding_dim)
+
+
+class HeteroGraphSAGEModel(nn.Module):
+    """Two HeteroSAGEConv layers. Nodes are numbered recipes, then ingredients, then any
+    recipes added at inference, so the ingredients are one block, set by set_ingredients."""
+
+    def __init__(self, input_dim, hidden=HIDDEN, embedding_dim=EMBEDDING_DIM):
+        super().__init__()
+        self.hidden, self.embedding_dim = hidden, embedding_dim
+        self.conv1 = HeteroSAGEConv(input_dim, hidden)
+        self.conv2 = HeteroSAGEConv(hidden, embedding_dim)
+        # [first, end) of the ingredient block, saved in the checkpoint with the weights
+        self.register_buffer("ingredient_range", torch.zeros(2, dtype=torch.long))
+
+    def set_ingredients(self, n_recipes, n_ingredients):
+        self.ingredient_range.copy_(torch.tensor([n_recipes, n_recipes + n_ingredients]))
+
+    def forward(self, node_x, edge_index, edge_weight):
+        """Raw embeddings, used by the loss. Normalise them for retrieval."""
+        first, end = self.ingredient_range.tolist()
+        if end == 0:
+            raise RuntimeError("Call set_ingredients before using the model.")
+        index = torch.arange(len(node_x), device=node_x.device)
+        is_ingredient = (index >= first) & (index < end)
+        hidden = F.relu(self.conv1(node_x, edge_index, edge_weight, is_ingredient))
+        return self.conv2(hidden, edge_index, edge_weight, is_ingredient)
+
+
+MODELS = {"gcn": GCNModel, "graphsage": GraphSAGEModel,
+          "graphsage_wide": WideGraphSAGEModel, "graphsage_hetero": HeteroGraphSAGEModel}
 
 
 def train(model_name, steps, seed, data_dir=DATA_DIR, output_dir=OUTPUT_DIR,
@@ -284,6 +344,8 @@ def train(model_name, steps, seed, data_dir=DATA_DIR, output_dir=OUTPUT_DIR,
     generator = torch.Generator(device=device).manual_seed(seed)
 
     model = MODELS[model_name](node_x.shape[1]).to(device)
+    if isinstance(model, HeteroGraphSAGEModel):
+        model.set_ingredients(n_recipes, len(ingredient_x))
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
     losses = []
     training_started = time.perf_counter()
@@ -348,7 +410,7 @@ def train(model_name, steps, seed, data_dir=DATA_DIR, output_dir=OUTPUT_DIR,
         "data_sha256": fingerprints,
         "training_feature_scheme": FEATURE_SCHEME,
         "inference_policy": INFERENCE_POLICY,
-        "input_dim": int(ingredient_x.shape[1]), "hidden": HIDDEN, "out": EMBEDDING_DIM,
+        "input_dim": int(ingredient_x.shape[1]), "hidden": model.hidden, "out": model.embedding_dim,
         "learning_rate": 1e-3, "weight_decay": 1e-5,
         "negative_loss_weight": 1.0,
         "substitution_supervision": False,
