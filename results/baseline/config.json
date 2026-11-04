@@ -1,0 +1,22 @@
+{
+  "evaluations": [
+    "separability",
+    "substitution",
+    "same_dish",
+    "duplicates"
+  ],
+  "seeds": [
+    0,
+    1,
+    2
+  ],
+  "git_commit": "b051e960445629e7ded728e76b41a53dc312b893",
+  "methods": [
+    "Sentence mean",
+    "Node2Vec",
+    "gcn",
+    "graphsage"
+  ],
+  "probe_ingredients": 100,
+  "substitution_cases": 3000
+}

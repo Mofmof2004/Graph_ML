@@ -1,0 +1,47 @@
+evaluation,metric,method,mean,std,count
+separability,auc_known,Sentence mean,0.9323876066356318,0.0,1
+separability,auc_known,Node2Vec,0.9638091631729075,0.0,1
+separability,auc_known,gcn,0.9298521309034541,0.0018577977674587914,3
+separability,auc_known,graphsage,0.9480939431432153,0.0011153967493617634,3
+separability,auc_unseen,Sentence mean,0.944496139837965,0.0,1
+separability,auc_unseen,gcn,0.9292169983914164,0.0027601084983616252,3
+separability,auc_unseen,graphsage,0.946194713861082,0.001326668897790603,3
+substitution,win_rate_all,Multi-hot,0.563,0.0,1
+substitution,win_rate_similar_names,Multi-hot,0.5646666666666667,0.0,1
+substitution,win_rate_dissimilar_names,Multi-hot,0.5613333333333334,0.0,1
+substitution,win_rate_unseen_recipes,Multi-hot,0.558987558987559,0.0,1
+substitution,cos_gap,Multi-hot,0.00231805513612926,0.0,1
+substitution,win_rate_all,Sentence mean,0.8146666666666667,0.0,1
+substitution,win_rate_similar_names,Sentence mean,0.9626666666666667,0.0,1
+substitution,win_rate_dissimilar_names,Sentence mean,0.6666666666666666,0.0,1
+substitution,win_rate_unseen_recipes,Sentence mean,0.8095238095238095,0.0,1
+substitution,cos_gap,Sentence mean,0.019118131797031486,0.0,1
+substitution,win_rate_all,gcn,0.7987777777777779,0.002545875386086576,3
+substitution,win_rate_similar_names,gcn,0.8731111111111112,0.0007698003589194804,3
+substitution,win_rate_dissimilar_names,gcn,0.7244444444444444,0.005003702332976706,3
+substitution,win_rate_unseen_recipes,gcn,0.8002288002288003,0.002362750127535932,3
+substitution,cos_gap,gcn,0.06686586141586304,0.0006036388626439403,3
+substitution,win_rate_all,graphsage,0.7736666666666666,0.00916515138991166,3
+substitution,win_rate_similar_names,graphsage,0.8924444444444445,0.011339867397487177,3
+substitution,win_rate_dissimilar_names,graphsage,0.6548888888888889,0.0073434273963814585,3
+substitution,win_rate_unseen_recipes,graphsage,0.7777777777777777,0.011178733780176224,3
+substitution,cos_gap,graphsage,0.05205474918087324,0.0019714052809612238,3
+same_dish,mrr_known,Sentence mean,0.3086436104358669,0.0,1
+same_dish,hits@10_known,Sentence mean,0.5230237912509593,0.0,1
+same_dish,mrr_unseen,Sentence mean,0.3208077283466194,0.0,1
+same_dish,hits@10_unseen,Sentence mean,0.5453514739229025,0.0,1
+same_dish,mrr_known,Node2Vec,0.20872231023317434,0.0,1
+same_dish,hits@10_known,Node2Vec,0.39600920951650037,0.0,1
+same_dish,mrr_known,gcn,0.2746480020473349,0.005336872718756603,3
+same_dish,hits@10_known,gcn,0.473650550012791,0.007141225301718016,3
+same_dish,mrr_unseen,gcn,0.27160942663901877,0.00788728726062518,3
+same_dish,hits@10_unseen,gcn,0.47921390778533635,0.00858489545850381,3
+same_dish,mrr_known,graphsage,0.3092871120694574,0.0021024996653295647,3
+same_dish,hits@10_known,graphsage,0.5204655922230749,0.0014527777809671147,3
+same_dish,mrr_unseen,graphsage,0.30686580609706465,0.0036364790399106275,3
+same_dish,hits@10_unseen,graphsage,0.518896447467876,0.0006545921419383305,3
+duplicates,title_groups,data,1019.0,0.0,1
+duplicates,pairs,data,9846.0,0.0,1
+duplicates,mean_jaccard_same_title,data,0.3217677405858476,0.0,1
+duplicates,mean_jaccard_random,data,0.06075725286231422,0.0,1
+duplicates,identical_ingredient_sets,data,0.0010156408693885843,0.0,1
