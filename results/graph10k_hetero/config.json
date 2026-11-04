@@ -1,0 +1,35 @@
+{
+  "evaluations": [
+    "separability",
+    "substitution",
+    "same_dish",
+    "duplicates"
+  ],
+  "seeds": [
+    0,
+    1,
+    2
+  ],
+  "git_commit": "780d200eea4ee0c611014e240d927c149b48000d",
+  "data_dir": "data\\processed_10k",
+  "model_dir": "data\\models_10k",
+  "models": [
+    "gcn",
+    "graphsage",
+    "graphsage_wide",
+    "graphsage_hetero"
+  ],
+  "methods": [
+    "Sentence mean",
+    "Node2Vec",
+    "gcn",
+    "graphsage",
+    "graphsage_wide",
+    "graphsage_hetero",
+    "Multi-hot",
+    "data"
+  ],
+  "checkpoints": [],
+  "probe_ingredients": 100,
+  "substitution_cases": 3000
+}
