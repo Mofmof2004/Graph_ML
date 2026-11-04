@@ -12,4 +12,5 @@ pyenv.cfg
 pyvenv.cfg
 
 evaluation_outputs
-results
+results/overnight/
+results/overnight_smoke/
