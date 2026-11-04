@@ -19,6 +19,9 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from scipy.sparse import csr_matrix
+
+from torch_geometric.nn.conv.gcn_conv import gcn_norm
 
 from train_recipe_similarity import MODELS, bidirectional_edges, embed_new_recipes
 from graph_features import (FEATURE_SCHEME, INFERENCE_POLICY, data_fingerprints,
@@ -46,6 +49,7 @@ class RecipeData:
     train_edges: np.ndarray
     train_weights: np.ndarray
     directory: Path = Path("data/processed")
+    split: np.ndarray = None   # "train", "val", "test" or "heldout" per recipe, from build_graph.py
 
     def weights(self, ids, shares):
         """Edge weights as in build_graph.py: idf * share ** share_exponent."""
@@ -82,11 +86,15 @@ def load_data(directory=DATA_DIR):
     recipe_shares = [weights["share"][order[a:b]] for a, b in zip(bounds[:-1], bounds[1:])]
     known = np.zeros(n_recipes, dtype=bool)
     known[np.unique(train[0])] = True
+    split = np.full(n_recipes, "", dtype=object)
+    for name in ["train", "val", "test", "heldout"]:
+        if name in edges:
+            split[np.unique(edges[name][0])] = name
 
     return RecipeData(
         n_recipes, n_ingredients, ingredients,
         np.load(directory / "ingredient_x.npy").astype(np.float32), idf, share_exponent,
-        recipe_ingredients, recipe_shares, known, train, weights["train"], directory,
+        recipe_ingredients, recipe_shares, known, train, weights["train"], directory, split,
     )
 
 
@@ -121,13 +129,97 @@ class SentenceMean:
 
     def __init__(self, data, name="Sentence mean"):
         self.data, self.name = data, name
+        self.features = data.ingredient_x
 
     def embed(self, recipes):
-        x = self.data.ingredient_x
+        x = self.features
         return np.stack([(x[ids] * w[:, None]).sum(0) / w.sum() for ids, w in recipes])
 
     def recipes(self):
         return self.embed(all_recipes(self.data))
+
+
+class PPMIMean(SentenceMean):
+    """Ingredients described by the ingredients they appear with: positive PMI of
+    co-occurrence in training recipes, reduced by SVD to `dim` numbers. A recipe is the
+    weighted mean of its ingredients' vectors, as in SentenceMean, so two ingredients are
+    alike when they have the same partners (second-order co-occurrence), whatever their names."""
+
+    def __init__(self, data, dim=256, name="PPMI"):
+        super().__init__(data, name)
+        recipes, ingredients = data.train_edges
+        occurs = csr_matrix((np.ones(len(recipes)), (recipes, ingredients)),
+                            shape=(data.n_recipes, data.n_ingredients))
+        counts = (occurs.T @ occurs).toarray()
+        np.fill_diagonal(counts, 0)
+        totals = counts.sum(1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pmi = np.log(counts * counts.sum() / np.outer(totals, totals))
+        ppmi = np.where(counts > 0, np.maximum(pmi, 0), 0)
+        u, s, _ = np.linalg.svd(ppmi)
+        dim = min(dim, len(s))
+        self.features = (u[:, :dim] * np.sqrt(s[:dim])).astype(np.float32)
+
+
+def unit(x):
+    return x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-12)
+
+
+class Centred:
+    """A method with its mean embedding over training recipes subtracted. Embeddings tend to
+    share one direction, which compresses all cosines; centring removes it."""
+
+    def __init__(self, method, data):
+        self.method, self.data, self.mean = method, data, None
+        self.name, self.seed, self.inductive = method.name, getattr(method, "seed", None), method.inductive
+
+    def recipes(self):
+        z = self.method.recipes()
+        if self.mean is None:
+            self.mean = z[self.data.known].mean(0)
+        return z - self.mean
+
+    def embed(self, recipes):
+        if self.mean is None:
+            self.recipes()
+        return self.method.embed(recipes) - self.mean
+
+
+class Fusion:
+    """Sentence mean and a GNN side by side, each scaled to length 1 and then by the square
+    root of its weight; no training involved. With mode "cosine", cosine on the result is
+    weight * cos(sentence mean) + (1 - weight) * cos(GNN). With "zscore", each cosine is first
+    divided by its spread over random pairs of training recipes, so a method whose cosines
+    vary little (heavily smoothed ones) is not drowned out and the weight means the same for
+    every partner. Constant offsets do not change any ranking or comparison."""
+    inductive = True
+    PAIRS = 20_000     # random training-recipe pairs used to measure the spread
+
+    def __init__(self, sentence, gnn, weight, known, mode="cosine"):
+        self.sentence, self.gnn, self.weight, self.known, self.mode = sentence, gnn, weight, known, mode
+        self.name, self.seed = f"fusion {gnn.name} {weight:g}", getattr(gnn, "seed", None)
+        self.scales = None
+
+    def spread(self, x):
+        a, b = np.random.default_rng(0).choice(np.flatnonzero(self.known), (2, self.PAIRS))
+        x = unit(x)
+        return float(np.std((x[a] * x[b]).sum(1)))
+
+    def combine(self, x, z):
+        """Fused embeddings from the parts' embeddings. The first call must pass embeddings of
+        all recipes, which set the zscore scales."""
+        if self.scales is None:
+            self.scales = (self.spread(x), self.spread(z)) if self.mode == "zscore" else (1.0, 1.0)
+        return np.hstack([np.sqrt(self.weight / self.scales[0]) * unit(x),
+                          np.sqrt((1 - self.weight) / self.scales[1]) * unit(z)]).astype(np.float32)
+
+    def embed(self, recipes):
+        if self.scales is None:
+            self.recipes()
+        return self.combine(self.sentence.embed(recipes), self.gnn.embed(recipes))
+
+    def recipes(self):
+        return self.combine(self.sentence.recipes(), self.gnn.recipes())
 
 
 class Node2VecMethod:
@@ -166,15 +258,21 @@ class GNNMethod:
             if config.get(key) != value:
                 raise ValueError(f"{self.checkpoint_path}: checkpoint {key} does not match. Retrain for this data/protocol.")
         self.config = config
+        self.load_graph()
+        self.model = MODELS[model_name](self.node_x.shape[1], config["hidden"], config["out"]).to(self.device)
+        self.model.load_state_dict(checkpoint["state_dict"])
+        self.model.eval()
+
+    def load_graph(self):
+        """Node features and bidirectional training edges, built as in training."""
+        data = self.data
         recipe_x = pooled_recipe_features(data.train_edges, data.ingredient_x,
                                           data.n_recipes, data.train_weights)
         self.ingredient_x = torch.as_tensor(data.ingredient_x, device=self.device)
         self.node_x = torch.cat([torch.as_tensor(recipe_x, device=self.device), self.ingredient_x])
-        self.edges = bidirectional_edges(torch.as_tensor(data.train_edges, device=self.device), data.n_recipes)
+        self.edges = bidirectional_edges(torch.as_tensor(data.train_edges, dtype=torch.long, device=self.device),
+                                         data.n_recipes)
         self.edge_weights = torch.as_tensor(np.tile(data.train_weights, 2), device=self.device).float()
-        self.model = MODELS[model_name](self.node_x.shape[1], config["hidden"], config["out"]).to(self.device)
-        self.model.load_state_dict(checkpoint["state_dict"])
-        self.model.eval()
 
     @torch.no_grad()
     def embed(self, recipes):
@@ -191,13 +289,69 @@ class GNNMethod:
         return embeddings
 
 
-def build_methods(data, seeds, include_multihot=False):
-    """All methods to evaluate. GNNs get one entry per seed; results are grouped by name."""
-    methods = [SentenceMean(data)]
+class SGCPropagation(torch.nn.Module):
+    """K rounds of GCN propagation (symmetric normalisation, self-loops, edge weights) with
+    no weights to learn: SGC (Wu et al. 2019) without its classifier."""
+
+    def __init__(self, k, embedding_dim, alpha=0.0):
+        super().__init__()
+        self.k, self.embedding_dim, self.alpha = k, embedding_dim, alpha
+
+    def forward(self, node_x, edge_index, edge_weight):
+        """With alpha > 0 every hop keeps that fraction of each node's own input,
+        z <- alpha * x + (1 - alpha) * A z, which is APPNP propagation (Gasteiger et al. 2019)."""
+        edge_index, norm = gcn_norm(edge_index, edge_weight, len(node_x))
+        source, target = edge_index
+        adjacency = torch.sparse_coo_tensor(torch.stack([target, source]), norm,
+                                            (len(node_x), len(node_x))).coalesce()
+        z = node_x
+        for _ in range(self.k):
+            z = self.alpha * node_x + (1 - self.alpha) * torch.sparse.mm(adjacency, z)
+        return z
+
+
+class PropagationMethod(GNNMethod):
+    """The GNN input features smoothed over the training graph by SGCPropagation, with no
+    training. Recipes are embedded exactly as in GNNMethod, new ones by incoming edges only."""
+
+    def __init__(self, data, k, alpha=0.0, device="cpu", batch_size=8192):
+        self.data, self.seed = data, None
+        self.name = f"appnp{alpha:g}" if alpha else f"sgc{k}"
+        self.device, self.batch_size = torch.device(device), batch_size
+        self.load_graph()
+        self.model = SGCPropagation(k, self.node_x.shape[1], alpha)
+
+
+APPNP_HOPS = 10
+
+
+def build_methods(data, seeds, include_multihot=False, model_names=None,
+                  similarity_dir=SIMILARITY_DIR, node2vec_file=NODE2VEC_FILE, fusion_weights=(),
+                  propagation_hops=(), appnp_alphas=(), ppmi=False, centre=False, fusion_mode="cosine"):
+    """All methods to evaluate. GNNs get one entry per seed; results are grouped by name.
+    model_names defaults to every model in MODELS. The untrained graph methods: an SGC
+    propagation per entry of propagation_hops, an APPNP propagation (APPNP_HOPS hops) per entry
+    of appnp_alphas, and PPMI. Each fusion weight adds a Fusion of the sentence mean with every
+    GNN and untrained graph method, after the methods it combines. centre=True centres every
+    method except the fusions, which are built from centred parts."""
+    def maybe_centred(method):
+        return Centred(method, data) if centre else method
+
+    sentence = maybe_centred(SentenceMean(data))
+    methods = [sentence]
     if include_multihot:
         methods.insert(0, MultiHot(data))
-    if NODE2VEC_FILE.exists():
-        methods.append(Node2VecMethod(data))
-    for model_name in MODELS:
-        methods += [GNNMethod(data, model_name, seed) for seed in seeds]
+    if Path(node2vec_file).exists():
+        methods.append(maybe_centred(Node2VecMethod(data, node2vec_file)))
+    partners = [GNNMethod(data, model_name, seed,
+                          checkpoint_path=Path(similarity_dir) / f"{model_name}_inductive_s{seed}.pt")
+                for model_name in model_names or MODELS for seed in seeds]
+    partners += [PropagationMethod(data, k) for k in propagation_hops]
+    partners += [PropagationMethod(data, APPNP_HOPS, alpha) for alpha in appnp_alphas]
+    if ppmi:
+        partners.append(PPMIMean(data))
+    partners = [maybe_centred(m) for m in partners]
+    methods += partners
+    methods += [Fusion(sentence, partner, weight, data.known, fusion_mode)
+                for partner in partners for weight in fusion_weights]
     return methods
