@@ -31,6 +31,7 @@ import json
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import matplotlib
 matplotlib.use("Agg")
@@ -42,7 +43,8 @@ from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.model_selection import train_test_split
 
 import eval_common
-from embedders import MultiHot, NODE2VEC_FILE, SIMILARITY_DIR, build_methods, load_data
+from embedders import (DATA_DIR, Fusion, MultiHot, NODE2VEC_FILE, SIMILARITY_DIR, build_methods,
+                       load_data)
 from train_recipe_similarity import MODELS, train
 
 
@@ -55,6 +57,7 @@ SUBSTITUTION_SEED = 1        # not SEED: build_graph.py shuffles the recipes int
                              # default_rng(SEED), so the same seed replays that order and every
                              # case would come from the first split (held-out)
 RETRIEVAL_K = 10
+RRF_K = 60                   # usual constant of reciprocal rank fusion (Cormack et al. 2009)
 
 
 def unit(x):
@@ -84,7 +87,7 @@ def first_seed(methods):
         seen.setdefault(m.name, m)
     return list(seen.values())
 
-def separability(data, methods, embeddings, out):
+def separability(data, methods, embeddings, out, **_):
     rng = np.random.default_rng(SEED)
     counts = data.ingredients["recipe_count"].to_numpy()
     probes = rng.choice(np.flatnonzero(counts > MIN_RECIPES), PROBE_INGREDIENTS, replace=False)
@@ -141,13 +144,15 @@ def separability(data, methods, embeddings, out):
     fig.tight_layout(); fig.savefig(out / "roc_examples.png", dpi=130); plt.close(fig)
     return metrics
 
-def substitution_cases(data, rng):
-    """(recipe, position, ingredient, substitute, random) for recipes with a known substitute.
-    The random ingredient is about as frequent as the substitute, so frequency (and with it
-    the IDF edge weight) cannot decide the test."""
+def substitution_cases(data, rng, candidates=None, limit=SUBSTITUTION_CASES):
+    """(recipe, position, ingredient, substitute, random) for recipes with a known substitute,
+    at most one case per recipe and `limit` in total (None: no limit). The random ingredient is
+    about as frequent as the substitute, so frequency (and with it the IDF edge weight) cannot
+    decide the test. candidates restricts the recipes (default: all)."""
     pairs = eval_common.load_pairs()
     cases = []
-    for recipe_id in rng.permutation(data.n_recipes):
+    candidates = np.arange(data.n_recipes) if candidates is None else candidates
+    for recipe_id in rng.permutation(candidates):
         present = set(data.recipe_ingredients[recipe_id])
         options = [(p, a) for p, a in enumerate(data.recipe_ingredients[recipe_id]) if a in pairs]
         if not options:
@@ -160,14 +165,19 @@ def substitution_cases(data, rng):
         random = eval_common.matched_random(rng, substitute, present | set(pairs[ingredient]) | {ingredient})
         if random is not None:
             cases.append((recipe_id, position, ingredient, substitute, random))
-        if len(cases) == SUBSTITUTION_CASES:
+        if len(cases) == limit:
             break
     return cases
 
 
-def substitution(data, methods, embeddings, out):
+def substitution(data, methods, embeddings, out, split=None, **_):
+    """With split ("val" or "test"), every recipe of that build split with a known substitute
+    gives a case, so settings can be chosen on val and reported on test."""
     rng = np.random.default_rng(SUBSTITUTION_SEED)
-    cases = substitution_cases(data, rng)
+    if split:
+        cases = substitution_cases(data, rng, np.flatnonzero(data.split == split), limit=None)
+    else:
+        cases = substitution_cases(data, rng)
     original = [data.recipe(r) for r, *_ in cases]
     substituted = [data.recipe(r, (p, b)) for r, p, a, b, x in cases]
     randomised = [data.recipe(r, (p, x)) for r, p, a, b, x in cases]
@@ -176,8 +186,9 @@ def substitution(data, methods, embeddings, out):
     text_similarity = np.array([x[a] @ x[b] for _, _, a, b, _ in cases])
     groups = {"all": np.ones(len(cases), dtype=bool),
               "similar_names": text_similarity >= np.median(text_similarity),
-              "dissimilar_names": text_similarity < np.median(text_similarity),
-              "unseen_recipes": ~data.known[[r for r, *_ in cases]]}
+              "dissimilar_names": text_similarity < np.median(text_similarity)}
+    if not split:   # a split's recipes are all unseen
+        groups["unseen_recipes"] = ~data.known[[r for r, *_ in cases]]
 
     names = data.ingredients["name"].to_numpy()
     rows, metrics = [], []
@@ -252,33 +263,73 @@ def retrieval_ranks(z, queries, candidates, titles):
     return np.concatenate(ranks)
 
 
-def same_dish(data, methods, embeddings, out):
+def rrf_ranks(x, z, weight, queries, candidates, titles):
+    """As retrieval_ranks, with candidates ordered by weighted reciprocal rank fusion of the
+    two embeddings' rankings: weight / (RRF_K + rank by x) + (1 - weight) / (RRF_K + rank by z).
+    Only the order of each ranking counts, not how spread out its cosines are."""
+    x, z = unit(x.astype(np.float32)), unit(z.astype(np.float32))
+    ranks = []
+    for start in range(0, len(queries), 256):
+        q = queries[start:start + 256]
+        itself = candidates[None, :] == q[:, None]
+        score = np.zeros((len(q), len(candidates)))
+        for part, part_weight in ((x, weight), (z, 1 - weight)):
+            sims = part[q] @ part[candidates].T
+            sims[itself] = -np.inf
+            position = np.argsort(np.argsort(-sims, axis=1), axis=1)
+            score += part_weight / (RRF_K + position + 1)
+        score[itself] = -np.inf
+        order = np.argsort(-score, axis=1)
+        match = titles[candidates][order] == titles[q][:, None]
+        ranks.append(match.argmax(1))
+    return np.concatenate(ranks)
+
+
+def same_dish(data, methods, embeddings, out, split=None, rrf=False):
+    """Without split: known queries among known recipes, and unseen queries among all recipes.
+    With split ("val" or "test"): queries from that build split among all recipes, inductive
+    methods only. rrf adds a rank-fused version of every Fusion method ("rrf ...")."""
     titles = eval_common.titles
     size = pd.Series(titles).map(pd.Series(titles).value_counts()).to_numpy()
     in_group = (size >= 2) & (size <= eval_common.MAX_GROUP)
-    known = np.flatnonzero(data.known)
     everything = np.arange(data.n_recipes)
-    # queries need another recipe with the same title among the candidates
-    known_titles = pd.Series(titles[known]).value_counts()
-    known_queries = known[in_group[known] & (pd.Series(titles[known]).map(known_titles).to_numpy() >= 2)]
-    unseen_queries = np.flatnonzero(in_group & ~data.known)
+    if split:
+        settings = [(split, np.flatnonzero(in_group & (data.split == split)), everything, True)]
+    else:
+        known = np.flatnonzero(data.known)
+        # queries need another recipe with the same title among the candidates
+        known_titles = pd.Series(titles[known]).value_counts()
+        known_queries = known[in_group[known] & (pd.Series(titles[known]).map(known_titles).to_numpy() >= 2)]
+        unseen_queries = np.flatnonzero(in_group & ~data.known)
+        settings = [("known", known_queries, known, False), ("unseen", unseen_queries, everything, True)]
 
     metrics, rank_table = [], []
+
+    def record(m, setting, queries, ranks):
+        nonlocal metrics
+        metrics += metric_rows("same_dish", f"mrr_{setting}", {m: np.mean(1 / (ranks + 1))})
+        metrics += metric_rows("same_dish", f"hits@{RETRIEVAL_K}_{setting}", {m: np.mean(ranks < RETRIEVAL_K)})
+        rank_table.append(pd.DataFrame({"method": m.name, "seed": getattr(m, "seed", None),
+                                        "setting": setting, "recipe_id": queries, "rank": ranks}))
+
     for m in methods:
-        settings = [("known", known_queries, known)]
-        if m.inductive:
-            settings.append(("unseen", unseen_queries, everything))
-        for setting, queries, candidates in settings:
-            ranks = retrieval_ranks(embeddings[m], queries, candidates, titles)
-            metrics += metric_rows("same_dish", f"mrr_{setting}", {m: np.mean(1 / (ranks + 1))})
-            metrics += metric_rows("same_dish", f"hits@{RETRIEVAL_K}_{setting}", {m: np.mean(ranks < RETRIEVAL_K)})
-            rank_table.append(pd.DataFrame({"method": m.name, "seed": getattr(m, "seed", None),
-                                            "setting": setting, "recipe_id": queries, "rank": ranks}))
+        for setting, queries, candidates, inductive_only in settings:
+            if m.inductive or not inductive_only:
+                record(m, setting, queries, retrieval_ranks(embeddings[m], queries, candidates, titles))
+    if rrf:
+        for m in methods:
+            if isinstance(m, Fusion):
+                fused = SimpleNamespace(name=f"rrf {m.gnn.name} {m.weight:g}", seed=m.seed)
+                for setting, queries, candidates, _ in settings:
+                    record(fused, setting, queries, rrf_ranks(embeddings[m.sentence], embeddings[m.gnn],
+                                                              m.weight, queries, candidates, titles))
     table = pd.concat(rank_table)
     table.to_csv(out / "ranks.csv", index=False)
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
-    for ax, setting in zip(axes, ["known", "unseen"]):
+    names = [setting for setting, *_ in settings]
+    fig, axes = plt.subplots(1, len(names), figsize=(6.5 * len(names), 4.5), squeeze=False)
+    axes = axes[0]
+    for ax, setting in zip(axes, names):
         for name, t in table[table.setting == setting].groupby("method", sort=False):
             k = np.arange(1, 101)
             ax.plot(k, [(t["rank"] < i).mean() for i in k], label=name)
@@ -288,7 +339,7 @@ def same_dish(data, methods, embeddings, out):
     fig.tight_layout(); fig.savefig(out / "hits_at_k.png", dpi=130); plt.close(fig)
     return metrics
 
-def duplicates(data, methods, embeddings, out):
+def duplicates(data, methods, embeddings, out, **_):
     rng = np.random.default_rng(SEED)
     sets = [set(ids) for ids in data.recipe_ingredients]
     titles = pd.Series(eval_common.titles)
@@ -317,16 +368,16 @@ EVALUATIONS = {"separability": separability, "substitution": substitution,
                "substitution_benchmark": substitution_benchmark}
 
 
-def ensure_trained(seeds, steps, retrain):
-    for model_name in MODELS:
+def ensure_trained(seeds, steps, retrain, model_names, data_dir, similarity_dir, node2vec_file):
+    for model_name in model_names:
         for seed in seeds:
-            if retrain or not (SIMILARITY_DIR / f"{model_name}_inductive_s{seed}.pt").exists():
+            if retrain or not (similarity_dir / f"{model_name}_inductive_s{seed}.pt").exists():
                 print(f"training {model_name} seed {seed}")
-                train(model_name, steps, seed)
-    if not NODE2VEC_FILE.exists():
+                train(model_name, steps, seed, data_dir, similarity_dir)
+    if not node2vec_file.exists():
         print("training Node2Vec")
         import random_walk_embeddings
-        random_walk_embeddings.main()
+        random_walk_embeddings.main(data_dir, node2vec_file.parent)
 
 
 def summary_plot(summary, out):
@@ -337,7 +388,9 @@ def summary_plot(summary, out):
               ("substitution_benchmark", "macro_accuracy_all", "Substitution pair macro accuracy", 0.5),
               ("substitution_benchmark", "macro_accuracy_lower_text_similarity", "Substitution, lower name similarity", 0.5),
               ("same_dish", "mrr_known", "Same-dish MRR, known recipes", None),
-              ("same_dish", "mrr_unseen", "Same-dish MRR, unseen recipes", None)]
+              ("same_dish", "mrr_unseen", "Same-dish MRR, unseen recipes", None),
+              ("same_dish", "mrr_val", "Same-dish MRR, val queries", None),
+              ("same_dish", "mrr_test", "Same-dish MRR, test queries", None)]
     panels = [p for p in panels if ((summary.evaluation == p[0]) & (summary.metric == p[1])).any()]
     if not panels:
         return
@@ -355,22 +408,71 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, default=Path("results") / time.strftime("%Y%m%d_%H%M%S"))
     parser.add_argument("--only", nargs="+", choices=list(EVALUATIONS),
-                        default=[name for name in EVALUATIONS if name != "substitution_benchmark"])
+                        help="evaluations to run (default: all but substitution_benchmark; "
+                             "with --split: substitution and same_dish)")
+    parser.add_argument("--split", choices=["val", "test"],
+                        help="draw substitution cases and same-dish queries from this build split only: "
+                             "choose settings on val, report on test")
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     parser.add_argument("--steps", type=int, default=1000, help="training steps for missing checkpoints")
     parser.add_argument("--retrain", action="store_true")
+    parser.add_argument("--models", nargs="+", choices=list(MODELS), default=["gcn", "graphsage"])
+    parser.add_argument("--fusion", nargs="+", type=float, default=[],
+                        help="sentence-mean weights for fused sentence mean + GNN embeddings, e.g. 0.25 0.5 0.75")
+    parser.add_argument("--propagation", nargs="+", type=int, default=[],
+                        help="hops K of untrained SGC feature propagation baselines, e.g. 2 4")
+    parser.add_argument("--appnp", nargs="+", type=float, default=[],
+                        help="restart fractions alpha of untrained APPNP propagation baselines, e.g. 0.1 0.2")
+    parser.add_argument("--ppmi", action="store_true",
+                        help="add the untrained PPMI (second-order co-occurrence) baseline")
+    parser.add_argument("--centre", action="store_true",
+                        help="subtract each method's mean embedding over training recipes")
+    parser.add_argument("--fusion-mode", choices=["cosine", "zscore"], default="cosine",
+                        help="zscore divides each part's cosine by its spread before mixing")
+    parser.add_argument("--rrf", action="store_true",
+                        help="also rank-fuse every fusion pair in same_dish")
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR, help="graph built by build_graph.py")
+    parser.add_argument("--model-dir", type=Path,
+                        help="where GNN checkpoints and Node2Vec are kept (default data/similarity and data/node2vec)")
     parser.add_argument("--checkpoints", type=Path, nargs="+", default=[],
                         help="Existing checkpoints for --only substitution_benchmark; never trained by that task.")
     args = parser.parse_args()
+    split_evaluations = ["substitution", "same_dish"]
+    if args.only is None:
+        args.only = split_evaluations if args.split else [name for name in EVALUATIONS
+                                                          if name != "substitution_benchmark"]
+    if args.split and not set(args.only) <= set(split_evaluations):
+        parser.error("--split works with --only substitution same_dish.")
     if args.checkpoints and "substitution_benchmark" not in args.only:
         parser.error("--checkpoints requires --only substitution_benchmark.")
+    if any(not 0 < weight < 1 for weight in args.fusion):
+        parser.error("--fusion weights must be between 0 and 1; 0 and 1 are the GNN and the sentence mean.")
+    if any(k < 1 for k in args.propagation):
+        parser.error("--propagation hops must be at least 1.")
+    if any(not 0 < alpha < 1 for alpha in args.appnp):
+        parser.error("--appnp alphas must be between 0 and 1.")
+    if args.rrf and not args.fusion:
+        parser.error("--rrf needs --fusion weights.")
+    similarity_dir = args.model_dir or SIMILARITY_DIR
+    node2vec_file = args.model_dir / NODE2VEC_FILE.name if args.model_dir else NODE2VEC_FILE
+    if args.data_dir != DATA_DIR:
+        eval_common.load(args.data_dir)
 
     data, methods, embeddings = None, [], {}
     if any(name != "substitution_benchmark" for name in args.only):
-        ensure_trained(args.seeds, args.steps, args.retrain)
-        data = load_data()
-        methods = build_methods(data, args.seeds)
-        embeddings = {m: m.recipes() for m in methods}
+        ensure_trained(args.seeds, args.steps, args.retrain, args.models,
+                       args.data_dir, similarity_dir, node2vec_file)
+        data = load_data(args.data_dir)
+        methods = build_methods(data, args.seeds, model_names=args.models,
+                                similarity_dir=similarity_dir, node2vec_file=node2vec_file,
+                                fusion_weights=args.fusion, propagation_hops=args.propagation,
+                                appnp_alphas=args.appnp, ppmi=args.ppmi, centre=args.centre,
+                                fusion_mode=args.fusion_mode)
+        embeddings = {}
+        for m in methods:
+            # a fusion reuses its parts' embeddings, which come earlier in the list
+            embeddings[m] = (m.combine(embeddings[m.sentence], embeddings[m.gnn])
+                             if isinstance(m, Fusion) else m.recipes())
     print("methods:", ", ".join(f"{m.name}{'' if getattr(m, 'seed', None) is None else f' s{m.seed}'}"
                                 for m in methods))
 
@@ -385,11 +487,15 @@ def main():
         if name == "substitution_benchmark":
             metrics += substitution_benchmark(folder, args.checkpoints)
         else:
-            metrics += EVALUATIONS[name](data, methods, embeddings, folder)
+            metrics += EVALUATIONS[name](data, methods, embeddings, folder, split=args.split, rrf=args.rrf)
 
     metrics = pd.DataFrame(metrics)
     (args.out / "config.json").write_text(json.dumps({
         "evaluations": args.only, "seeds": args.seeds, "git_commit": commit,
+        "data_dir": str(args.data_dir), "model_dir": str(similarity_dir), "models": args.models,
+        "fusion_weights": args.fusion, "propagation_hops": args.propagation, "split": args.split,
+        "appnp_alphas": args.appnp, "ppmi": args.ppmi, "centre": args.centre,
+        "fusion_mode": args.fusion_mode, "rrf": args.rrf,
         "methods": metrics["method"].drop_duplicates().tolist(),
         "checkpoints": [str(path.resolve()) for path in args.checkpoints],
         "probe_ingredients": PROBE_INGREDIENTS, "substitution_cases": SUBSTITUTION_CASES,

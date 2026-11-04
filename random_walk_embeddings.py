@@ -89,8 +89,8 @@ def collect_embeddings(model, labels, dimensions):
 	return embeddings, present
 
 
-def main():
-	edge_index, weights, recipes, ingredients = load_graph(DATA_DIR, SPLIT, WEIGHTED)
+def main(data_dir=DATA_DIR, output_dir=OUTPUT):
+	edge_index, weights, recipes, ingredients = load_graph(Path(data_dir), SPLIT, WEIGHTED)
 	n_recipes, n_ingredients = len(recipes), len(ingredients)
 	walks, graph_nodes = generate_walks(edge_index, weights, n_recipes, n_ingredients)
 	print(f"{len(walks)} walks of {WALK_LENGTH} nodes over {graph_nodes} nodes")
@@ -110,7 +110,7 @@ def main():
 		model, ingredient_labels, DIMENSIONS
 	)
 
-	output = OUTPUT / f"node2vec_{SPLIT}{'_weighted' if WEIGHTED else ''}.npz"
+	output = Path(output_dir) / f"node2vec_{SPLIT}{'_weighted' if WEIGHTED else ''}.npz"
 	output.parent.mkdir(parents=True, exist_ok=True)
 	np.savez_compressed(
 		output,

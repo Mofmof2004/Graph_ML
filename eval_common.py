@@ -22,26 +22,40 @@ WINDOW = 50              # random ingredients are drawn from this many frequency
 MAX_GROUP = 30           # same-dish groups larger than this ("Fudge") are too generic to count
 FEATURE_MODEL = "all-mpnet-base-v2"   # small, fast text model, 384 numbers per text
 
-edges = np.load(f"{DATA_DIR}/edges.npz")
-weights = np.load(f"{DATA_DIR}/edge_weights.npz")
-recipes = pd.read_csv(f"{DATA_DIR}/recipes.csv")
-ingredients = pd.read_csv(f"{DATA_DIR}/ingredients.csv")
-ingredient_x = np.load(f"{DATA_DIR}/ingredient_x.npy")
-with open(f"{DATA_DIR}/config.json") as f:
-    SHARE_EXPONENT = json.load(f).get("share_exponent", 1.0)
+def load(directory=DATA_DIR):
+    """Load the graph in `directory` into this module. Importing the module loads DATA_DIR;
+    run_experiments.py calls this again for another graph (--data-dir)."""
+    global edges, weights, recipes, ingredients, ingredient_x, SHARE_EXPONENT
+    global edge_index, share, idf, n_recipes, n_ingredients, order, rank
+    global edges_of_recipe, ings_of_recipe, titles, group_size, dish_queries
+    edges = np.load(f"{directory}/edges.npz")
+    weights = np.load(f"{directory}/edge_weights.npz")
+    recipes = pd.read_csv(f"{directory}/recipes.csv")
+    ingredients = pd.read_csv(f"{directory}/ingredients.csv")
+    ingredient_x = np.load(f"{directory}/ingredient_x.npy")
+    with open(f"{directory}/config.json") as f:
+        SHARE_EXPONENT = json.load(f).get("share_exponent", 1.0)
 
-edge_index, share = edges["all"], weights["share"]
-idf = ingredients["idf"].to_numpy()
-n_recipes, n_ingredients = len(recipes), len(ingredients)
+    edge_index, share = edges["all"], weights["share"]
+    idf = ingredients["idf"].to_numpy()
+    n_recipes, n_ingredients = len(recipes), len(ingredients)
+
+    # Frequency ranks, for drawing random ingredients as common as the true one
+    order = np.argsort(-ingredients["recipe_count"].to_numpy())
+    rank = np.empty(n_ingredients, dtype=int)
+    rank[order] = np.arange(n_ingredients)
+
+    edges_of_recipe = pd.Series(np.arange(edge_index.shape[1])).groupby(edge_index[0]).apply(np.array).to_dict()
+    ings_of_recipe = {r: set(edge_index[1, ks]) for r, ks in edges_of_recipe.items()}
+
+    # Same-dish retrieval: recipes that share a normalised title
+    titles = (recipes["title"].str.lower().str.replace(r"[^a-z ]", " ", regex=True)
+              .str.split().str.join(" ").to_numpy())
+    group_size = pd.Series(titles).map(pd.Series(titles).value_counts()).to_numpy()
+    dish_queries = np.flatnonzero((group_size >= 2) & (group_size <= MAX_GROUP))
 
 
-# Frequency ranks, for drawing random ingredients as common as the true one
-order = np.argsort(-ingredients["recipe_count"].to_numpy())
-rank = np.empty(n_ingredients, dtype=int)
-rank[order] = np.arange(n_ingredients)
-
-edges_of_recipe = pd.Series(np.arange(edge_index.shape[1])).groupby(edge_index[0]).apply(np.array).to_dict()
-ings_of_recipe = {r: set(edge_index[1, ks]) for r, ks in edges_of_recipe.items()}
+load()
 
 
 def edge_weight(ids, shares, alpha=SHARE_EXPONENT):
@@ -109,12 +123,6 @@ def calculate_edge_weights(graph, num_ingredients, edge_share=1, idf_graph=None,
     return weights, idf
 
 #----------Same-dish retrieval----------#
-
-titles = (recipes["title"].str.lower().str.replace(r"[^a-z ]", " ", regex=True)
-          .str.split().str.join(" ").to_numpy())
-group_size = pd.Series(titles).map(pd.Series(titles).value_counts()).to_numpy()
-dish_queries = np.flatnonzero((group_size >= 2) & (group_size <= MAX_GROUP))
-
 
 def same_dish(z):
     """MRR and hits@10 of finding another recipe with the same title. Recipes with an
