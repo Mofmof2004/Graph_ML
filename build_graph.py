@@ -40,13 +40,23 @@ OUT = "data/processed"
 # Load the dataset
 COLUMNS = ["title", "ingredients", "link", "source", "NER"]
 if RANDOM_SLICE:
-    # One pass over the file keeping a bit more than SLICE_SIZE rows, then trimmed to exactly
-    # SLICE_SIZE. The index stays the row number in the CSV, so row_id keeps its meaning.
-    slice_rng = np.random.default_rng(SEED)
-    keep_rate = 1.1 * SLICE_SIZE / RAW_ROWS
-    chunks = [chunk[slice_rng.random(len(chunk)) < keep_rate]
-              for chunk in pd.read_csv(RAW, usecols=COLUMNS, chunksize=200_000)]
-    pool = pd.concat(chunks)
+    def read_sample(n_rows):
+        """One pass over the file keeping each row with probability 1.1 * SLICE_SIZE / n_rows.
+        Returns the kept rows and the number of rows in the file."""
+        slice_rng = np.random.default_rng(SEED)
+        keep_rate = 1.1 * SLICE_SIZE / n_rows
+        chunks, seen = [], 0
+        for chunk in pd.read_csv(RAW, usecols=COLUMNS, chunksize=200_000):
+            chunks.append(chunk[slice_rng.random(len(chunk)) < keep_rate])
+            seen += len(chunk)
+        return pd.concat(chunks), seen
+
+    # Keep a bit more than SLICE_SIZE rows, then trim to exactly SLICE_SIZE. The index stays
+    # the row number in the CSV, so row_id keeps its meaning. RAW_ROWS saves a counting pass;
+    # for any other file (such as the test fixture) the pass is repeated with its real size.
+    pool, n_rows = read_sample(RAW_ROWS)
+    if n_rows != RAW_ROWS:
+        pool, _ = read_sample(n_rows)
     slice_df = pool.sample(n=min(SLICE_SIZE, len(pool)), random_state=SEED).sort_index()
 else:
     slice_df = pd.read_csv(RAW, nrows=SLICE_SIZE, usecols=COLUMNS)
