@@ -1,0 +1,89 @@
+evaluation,metric,method,mean,std,count
+substitution,win_rate_all,Multi-hot,0.5231666666666667,,1
+substitution,win_rate_similar_names,Multi-hot,0.5169773635153129,,1
+substitution,win_rate_dissimilar_names,Multi-hot,0.5293724966622163,,1
+substitution,win_rate_unseen_recipes,Multi-hot,0.5154277699859747,,1
+substitution,cos_gap,Multi-hot,-0.00036041284329257905,,1
+substitution,win_rate_all,Sentence mean,0.796,,1
+substitution,win_rate_similar_names,Sentence mean,0.9494007989347537,,1
+substitution,win_rate_dissimilar_names,Sentence mean,0.6421895861148198,,1
+substitution,win_rate_unseen_recipes,Sentence mean,0.7812061711079944,,1
+substitution,cos_gap,Sentence mean,0.015762881855566534,,1
+substitution,win_rate_all,gcn,0.7674444444444445,0.0015030832509409417,3
+substitution,win_rate_similar_names,gcn,0.8288948069241012,0.0006657789613847831,3
+substitution,win_rate_dissimilar_names,gcn,0.7058299955496218,0.0036766158526609625,3
+substitution,win_rate_unseen_recipes,gcn,0.7484805984104721,0.00428478325849074,3
+substitution,cos_gap,gcn,0.058649453024069466,0.001008103314207732,3
+substitution,win_rate_all,graphsage,0.7567777777777778,0.009008226692759696,3
+substitution,win_rate_similar_names,graphsage,0.8488681757656459,0.0026631158455393544,3
+substitution,win_rate_dissimilar_names,graphsage,0.6644414775255897,0.01697135288443998,3
+substitution,win_rate_unseen_recipes,graphsage,0.7512856474988312,0.0196520332463616,3
+substitution,cos_gap,graphsage,0.044668195148309074,0.0013852926294710597,3
+substitution,win_rate_all,fusion gcn 0.25,0.7813333333333333,0.004163331998932284,3
+substitution,win_rate_similar_names,fusion gcn 0.25,0.8546382600976475,0.0026907136380341927,3
+substitution,win_rate_dissimilar_names,fusion gcn 0.25,0.707832665776591,0.007737133355902801,3
+substitution,win_rate_unseen_recipes,fusion gcn 0.25,0.7601683029453016,0.007421462303126518,3
+substitution,cos_gap,fusion gcn 0.25,0.04792781050006548,0.0007560746811341772,3
+substitution,win_rate_all,fusion gcn 0.5,0.7968333333333333,0.0031754264805428966,3
+substitution,win_rate_similar_names,fusion gcn 0.5,0.883710608078118,0.0010169941622183195,3
+substitution,win_rate_dissimilar_names,fusion gcn 0.5,0.7097240765465065,0.006247394366429248,3
+substitution,win_rate_unseen_recipes,fusion gcn 0.5,0.7678821879382888,0.005294414049979507,3
+substitution,cos_gap,fusion gcn 0.5,0.037206169217824936,0.0005040537790086113,3
+substitution,win_rate_all,fusion gcn 0.75,0.8158888888888889,0.004299009360478456,3
+substitution,win_rate_similar_names,fusion gcn 0.75,0.9265423879272081,0.002771858854149314,3
+substitution,win_rate_dissimilar_names,fusion gcn 0.75,0.7049399198931909,0.009030540225947051,3
+substitution,win_rate_unseen_recipes,fusion gcn 0.75,0.8008415147265078,0.007421462303126418,3
+substitution,cos_gap,fusion gcn 0.75,0.026484526693820953,0.00025202340236970194,3
+substitution,win_rate_all,fusion graphsage 0.25,0.7676666666666666,0.011590225767142496,3
+substitution,win_rate_similar_names,fusion graphsage 0.25,0.8675099866844208,0.006351126507436453,3
+substitution,win_rate_dissimilar_names,fusion graphsage 0.25,0.6675567423230975,0.01684837044609339,3
+substitution,win_rate_unseen_recipes,fusion graphsage 0.25,0.7592332865825151,0.027495682005671138,3
+substitution,cos_gap,fusion graphsage 0.25,0.03744186833500862,0.0010389679647806432,3
+substitution,win_rate_all,fusion graphsage 0.5,0.7777777777777778,0.006585618450105483,3
+substitution,win_rate_similar_names,fusion graphsage 0.5,0.8885929871282734,0.002338138871028094,3
+substitution,win_rate_dissimilar_names,fusion graphsage 0.5,0.6666666666666666,0.011683832303360118,3
+substitution,win_rate_unseen_recipes,fusion graphsage 0.5,0.7662459093034127,0.013256144814172845,3
+substitution,cos_gap,fusion graphsage 0.5,0.030215539659063022,0.0006926463147355298,3
+substitution,win_rate_all,fusion graphsage 0.75,0.7933333333333333,0.0028480012484391687,3
+substitution,win_rate_similar_names,fusion graphsage 0.75,0.91988459831336,0.0013859294270746492,3
+substitution,win_rate_dissimilar_names,fusion graphsage 0.75,0.666444147752559,0.0060572574939100985,3
+substitution,win_rate_unseen_recipes,fusion graphsage 0.75,0.7872837774661057,0.005309872226087206,3
+substitution,cos_gap,fusion graphsage 0.75,0.022989211603999138,0.00034632449394419784,3
+same_dish,mrr_known,Sentence mean,0.3086436104358669,,1
+same_dish,hits@10_known,Sentence mean,0.5230237912509593,,1
+same_dish,mrr_unseen,Sentence mean,0.3208077283466194,,1
+same_dish,hits@10_unseen,Sentence mean,0.5453514739229025,,1
+same_dish,mrr_known,Node2Vec,0.22450845405386,,1
+same_dish,hits@10_known,Node2Vec,0.4121258633921719,,1
+same_dish,mrr_known,gcn,0.2751996579151724,0.006287226044498793,3
+same_dish,hits@10_known,gcn,0.4750575594781274,0.007351206469941685,3
+same_dish,mrr_unseen,gcn,0.2683588490821461,0.004548361246345626,3
+same_dish,hits@10_unseen,gcn,0.4754346182917611,0.003981728553610242,3
+same_dish,mrr_known,graphsage,0.30774841279479087,0.001024930569264225,3
+same_dish,hits@10_known,graphsage,0.520465592223075,0.002313013727299168,3
+same_dish,mrr_unseen,graphsage,0.30607580816997965,0.0022725372979770083,3
+same_dish,hits@10_unseen,graphsage,0.5245653817082389,0.0036446148000728916,3
+same_dish,mrr_known,fusion gcn 0.25,0.30009051673448167,0.0030719611403931695,3
+same_dish,hits@10_known,fusion gcn 0.25,0.5108723458685086,0.003481877101257669,3
+same_dish,mrr_unseen,fusion gcn 0.25,0.30456665327979016,0.0033727243066314205,3
+same_dish,hits@10_unseen,fusion gcn 0.25,0.509448223733938,0.0026183685677534587,3
+same_dish,mrr_known,fusion gcn 0.5,0.30979117881098567,0.000822110011358637,3
+same_dish,hits@10_known,fusion gcn 0.5,0.5276285495011512,0.003140964225584209,3
+same_dish,mrr_unseen,fusion gcn 0.5,0.3197830345505259,0.0017641374427710022,3
+same_dish,hits@10_unseen,fusion gcn 0.5,0.5377928949357521,0.005112528064425083,3
+same_dish,mrr_known,fusion gcn 0.75,0.3128875462643937,0.001478844960248489,3
+same_dish,hits@10_known,fusion gcn 0.75,0.5318495778971605,0.002030507529596765,3
+same_dish,mrr_unseen,fusion gcn 0.75,0.32486287077908055,0.00014619679401781704,3
+same_dish,hits@10_unseen,fusion gcn 0.75,0.5487528344671202,0.0022675736961451226,3
+same_dish,mrr_known,fusion graphsage 0.25,0.3154414345502446,0.0007385774189391237,3
+same_dish,hits@10_known,fusion graphsage 0.25,0.5309542082374009,0.001730333750123854,3
+same_dish,mrr_unseen,fusion graphsage 0.25,0.3149164303948742,0.001399736999292278,3
+same_dish,hits@10_unseen,fusion graphsage 0.25,0.5340136054421768,0.004087926616172403,3
+same_dish,mrr_known,fusion graphsage 0.5,0.317142058347426,0.0015646223488467216,3
+same_dish,hits@10_known,fusion graphsage 0.5,0.5356868764389869,0.0013835576651818537,3
+same_dish,mrr_unseen,fusion graphsage 0.5,0.31797142910262516,0.005110012570761548,3
+same_dish,hits@10_unseen,fusion graphsage 0.5,0.5438397581254725,0.004720331064549112,3
+same_dish,mrr_known,fusion graphsage 0.75,0.3177490831013454,0.0014226503951334222,3
+same_dish,hits@10_known,fusion graphsage 0.75,0.5370938859043234,0.00310165148451832,3
+same_dish,mrr_unseen,fusion graphsage 0.75,0.32204466456618386,0.001153122480483453,3
+same_dish,hits@10_unseen,fusion graphsage 0.75,0.5529100529100529,0.004720331064549034,3

@@ -1,0 +1,39 @@
+{
+  "evaluations": [
+    "substitution",
+    "same_dish"
+  ],
+  "seeds": [
+    0,
+    1,
+    2
+  ],
+  "git_commit": "780d200eea4ee0c611014e240d927c149b48000d",
+  "data_dir": "data\\processed_10k",
+  "model_dir": "data\\models_10k",
+  "models": [
+    "gcn",
+    "graphsage"
+  ],
+  "fusion_weights": [
+    0.25,
+    0.5,
+    0.75
+  ],
+  "methods": [
+    "Multi-hot",
+    "Sentence mean",
+    "gcn",
+    "graphsage",
+    "fusion gcn 0.25",
+    "fusion gcn 0.5",
+    "fusion gcn 0.75",
+    "fusion graphsage 0.25",
+    "fusion graphsage 0.5",
+    "fusion graphsage 0.75",
+    "Node2Vec"
+  ],
+  "checkpoints": [],
+  "probe_ingredients": 100,
+  "substitution_cases": 3000
+}
